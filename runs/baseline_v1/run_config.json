@@ -1,0 +1,13 @@
+{
+  "batch_size": 16,
+  "compile": true,
+  "data_version": "radolan_yw_mmh_v2_strict_128",
+  "device": "cuda",
+  "epochs": 0,
+  "lr": 0.0005,
+  "max_steps": 2000,
+  "run_id": "baseline_v1",
+  "seed": 42,
+  "time_budget": 1800,
+  "weight_decay": 0.01
+}
