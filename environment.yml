@@ -1,0 +1,23 @@
+name: radar-ml
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - uv
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - wradlib
+  - xarray
+  - netcdf4
+  - h5py
+  - cartopy
+  - pysteps
+  - gdal
+  - opencv
+  - jupyter
+  - ipykernel
+  - tqdm
+  - pyyaml
