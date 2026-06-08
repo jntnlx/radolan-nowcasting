@@ -4,7 +4,7 @@
 >
 > I'm currently developing the project codebase based on multiple local prototypes/experiments. My initial goal is a standalone version in this repo to build upon. I'm in the process of refactoring to ensure good readability.
 
-*Current Status*: Only working baseline "core" is fully compiled and verified atm. I'm going to integerate all local findings iteratively.
+*Current Status*: Only working baseline "core" is fully compiled and verified atm. I'm going to integerate all local findings that expand on the presently available baseline iteratively.
 
 ---
 
