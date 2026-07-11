@@ -249,9 +249,8 @@ def _plot_diagnostics(arrays: dict, path: Path) -> dict[str, Any]:
 
     dry_summary = _dry_false_alarm_summary(sources, targets)
     bias = _conditional_bias_summary(sources, targets)
-    psd = _psd_summary(sources, targets)
 
-    fig, axes = plt.subplots(1, 3, figsize=(17, 4.5), constrained_layout=True)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5), constrained_layout=True)
 
     # 1. False alarms below threshold
     thresholds = [0.1, 1.0, 5.0]
@@ -279,17 +278,7 @@ def _plot_diagnostics(arrays: dict, path: Path) -> dict[str, Any]:
     axes[1].set_xticks(x_bias)
     axes[1].set_xticklabels(bin_names, rotation=30, ha="right")
     axes[1].set_ylabel("Forecast − target (mm/h)")
-
-    # 3. Radial PSD of 30 minute accumulation
-    for name, values in psd.items():
-        r = np.asarray(values["radius"])
-        p = np.asarray(values["power"])
-        mask = r > 0
-        axes[2].loglog(r[mask], p[mask], label=name)
-    axes[2].set_title("Radial PSD of 30-min accumulation")
-    axes[2].set_xlabel("Radial wavenumber")
-    axes[2].set_ylabel("Power")
-    axes[2].legend(fontsize=8)
+    axes[1].legend(fontsize=8)
 
     fig.savefig(path, dpi=140, bbox_inches="tight", facecolor="white")
     plt.close(fig)
@@ -297,7 +286,6 @@ def _plot_diagnostics(arrays: dict, path: Path) -> dict[str, Any]:
     return {
         "below_threshold_false_alarm_rate": dry_summary,
         "conditional_bias_mmh": bias,
-        "radial_psd": psd,
     }
 
 
@@ -329,28 +317,6 @@ def _conditional_bias_summary(sources, targets):
                 if mask.any() else float("nan")
             )
     return out
-
-
-def _psd_summary(sources, targets):
-    accum = {"target": targets.sum(axis=0) / 12.0}
-    accum.update({n: v.sum(axis=0) / 12.0 for n, v in sources.items()})
-    return {
-        name: {"radius": r.tolist(), "power": p.tolist()}
-        for name, field in accum.items()
-        for r, p in [_radial_psd(field)]
-    }
-
-
-def _radial_psd(field: np.ndarray):
-    centered = field.astype(np.float64) - float(np.mean(field))
-    power = np.abs(np.fft.fftshift(np.fft.fft2(centered))) ** 2
-    yy, xx = np.indices(power.shape)
-    cy, cx = (power.shape[0] - 1) / 2.0, (power.shape[1] - 1) / 2.0
-    radius = np.sqrt((yy - cy) ** 2 + (xx - cx) ** 2).astype(np.int64)
-    total = np.bincount(radius.ravel(), weights=power.ravel())
-    count = np.bincount(radius.ravel())
-    radial = total / np.maximum(count, 1)
-    return np.arange(radial.size, dtype=np.float64), radial
 
 
 def _json_safe(value):

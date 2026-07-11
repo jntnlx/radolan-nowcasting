@@ -35,7 +35,6 @@ class ForecastLoss(nn.Module):
         mean, std: Normalization statistics from the training cache.
         physical_mae_weight: Weight for the mm/h MAE term.
         threshold_weight: Weight for the threshold-weighted MAE term.
-        gradient_weight: Weight for spatial gradient penalty (0 = disabled).
     """
 
     def __init__(
@@ -45,14 +44,12 @@ class ForecastLoss(nn.Module):
         *,
         physical_mae_weight: float = 0.1,
         threshold_weight: float = 0.05,
-        gradient_weight: float = 0.0,
     ):
         super().__init__()
         self.mean = float(mean)
         self.std = float(std)
         self.physical_mae_weight = physical_mae_weight
         self.threshold_weight = threshold_weight
-        self.gradient_weight = gradient_weight
 
         # Pre-compute threshold values in normalized-log space
         self.thresholds_norm = [
@@ -77,30 +74,27 @@ class ForecastLoss(nn.Module):
         physical_mae = (pred_mmh - target_mmh).abs().mean()
 
         # 3. Threshold-weighted MAE: extra penalty where target is heavy rain
-        threshold_mae = self._threshold_weighted_mae(prediction, target)
+        threshold_mae = self._threshold_weighted_mae(
+            target, pred_mmh, target_mmh,
+        )
 
-        # Combine
-        total = huber + self.physical_mae_weight * physical_mae
-        total = total + self.threshold_weight * threshold_mae
-
+        total = (
+            huber
+            + self.physical_mae_weight * physical_mae
+            + self.threshold_weight * threshold_mae
+        )
         parts = {
             "huber_norm": huber,
             "physical_mae_mmh": physical_mae,
             "threshold_weighted_mae_mmh": threshold_mae,
         }
-
-        # Spatial gradient penalty — disabled by default (gradient_weight=0.0).
-        # Planned extension for spectral/gradient loss to reduce blurring;
-        # enable via ForecastLoss(gradient_weight=...).
-        if self.gradient_weight > 0:
-            grad_loss = self._gradient_loss(prediction, target)
-            total = total + self.gradient_weight * grad_loss
-            parts["gradient_loss"] = grad_loss
-
         return total, parts
 
     def _threshold_weighted_mae(
-        self, prediction: torch.Tensor, target: torch.Tensor,
+        self,
+        target: torch.Tensor,
+        pred_mmh: torch.Tensor,
+        target_mmh: torch.Tensor,
     ) -> torch.Tensor:
         """MAE with cumulative weights above each rain threshold.
 
@@ -108,22 +102,10 @@ class ForecastLoss(nn.Module):
         receive (1 + N)× the base error — intentionally focusing gradient
         on the heaviest precipitation.
         """
-        pred_mmh = normalized_to_rate_mmh(prediction, self.mean, self.std)
-        target_mmh = normalized_to_rate_mmh(target, self.mean, self.std)
         error = (pred_mmh - target_mmh).abs()
-
         weighted = error.clone()
         for threshold_norm in self.thresholds_norm:
             mask = target > threshold_norm
             weighted = weighted + error * mask.float()
 
         return weighted.mean()
-
-    @staticmethod
-    def _gradient_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        """Difference in spatial gradients between prediction and target."""
-        dy_pred = prediction[:, :, 1:, :] - prediction[:, :, :-1, :]
-        dx_pred = prediction[:, :, :, 1:] - prediction[:, :, :, :-1]
-        dy_target = target[:, :, 1:, :] - target[:, :, :-1, :]
-        dx_target = target[:, :, :, 1:] - target[:, :, :, :-1]
-        return (dy_pred - dy_target).abs().mean() + (dx_pred - dx_target).abs().mean()

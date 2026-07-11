@@ -110,8 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     started = time.monotonic()
     best_score = float("inf")
     best_step = 0
-    best_val_event = None
-    best_val_all = None
+    best_selection = None
     step = 0
     epoch = 0
     time_budget = None if args.time_budget <= 0 else args.time_budget
@@ -148,31 +147,37 @@ def main(argv: list[str] | None = None) -> int:
                 val_event_rmse = ""
                 val_all_rmse = ""
 
-                # Validation
+                # Checkpoint selection only needs the declared selection metric.
+                # The complete deterministic verification suite runs once below.
                 should_validate = (
                     step == 1
                     or step % args.val_interval_steps == 0
                     or step >= args.max_steps
                 )
                 if should_validate:
-                    val_event = evaluate(model, loaders["val_event"],
-                                         device=device, mean=mean, std=std)
-                    val_all = evaluate(model, loaders["val_all"],
-                                       device=device, mean=mean, std=std)
-                    val_event_rmse = f"{val_event['rmse_log_norm']:.8g}"
-                    val_all_rmse = f"{val_all['rmse_log_norm']:.8g}"
+                    event_rmse = _normalized_log_rmse(
+                        model, loaders["val_event"], device,
+                    )
+                    all_rmse = _normalized_log_rmse(
+                        model, loaders["val_all"], device,
+                    )
+                    val_event_rmse = f"{event_rmse:.8g}"
+                    val_all_rmse = f"{all_rmse:.8g}"
 
-                    score = float(val_event["rmse_log_norm"])
-                    if score < best_score:
-                        best_score = score
+                    selection = {
+                        "kind": "checkpoint_selection",
+                        "metric": "rmse_log_norm",
+                        "val_event_rmse_log_norm": event_rmse,
+                        "val_all_rmse_log_norm": all_rmse,
+                    }
+                    if event_rmse < best_score:
+                        best_score = event_rmse
                         best_step = step
-                        best_val_event = val_event
-                        best_val_all = val_all
+                        best_selection = selection
                         _save_checkpoint(
                             run_dir / "checkpoint_best.pt",
                             model=model, optimizer=optimizer, config=config,
-                            step=step, epoch=epoch,
-                            val_event=val_event, val_all=val_all,
+                            step=step, epoch=epoch, validation=selection,
                         )
                     train_model.train()
 
@@ -204,41 +209,71 @@ def main(argv: list[str] | None = None) -> int:
         include_optical_flow=args.include_optical_flow_final_eval,
     )
 
-    if best_val_event is None:
+    if best_selection is None:
         best_step = step
-        best_val_event = final_val_event
-        best_val_all = final_val_all
         best_score = float(final_val_event["rmse_log_norm"])
+        best_selection = {
+            "kind": "checkpoint_selection",
+            "metric": "rmse_log_norm",
+            "val_event_rmse_log_norm": best_score,
+            "val_all_rmse_log_norm": float(final_val_all["rmse_log_norm"]),
+        }
         _save_checkpoint(
             run_dir / "checkpoint_best.pt",
             model=model, optimizer=optimizer, config=config,
-            step=step, epoch=epoch,
-            val_event=final_val_event, val_all=final_val_all,
+            step=step, epoch=epoch, validation=best_selection,
         )
 
+    final_verification = {
+        "kind": "full_verification",
+        "val_event": final_val_event,
+        "val_all": final_val_all,
+    }
     _save_checkpoint(
         run_dir / "checkpoint_final.pt",
         model=model, optimizer=optimizer, config=config,
-        step=step, epoch=epoch,
-        val_event=final_val_event, val_all=final_val_all,
+        step=step, epoch=epoch, validation=final_verification,
     )
 
     metrics = {
-        "run_id": run_id, "data_version": DATA_VERSION,
-        "best_step": best_step, "final_step": step,
-        "best_val_event": best_val_event, "best_val_all": best_val_all,
-        "final_val_event": final_val_event, "final_val_all": final_val_all,
+        "run_id": run_id,
+        "data_version": DATA_VERSION,
+        "best_step": best_step,
+        "final_step": step,
+        "best_selection": best_selection,
+        "final_verification": final_verification,
     }
     _write_json(run_dir / "metrics.json", metrics)
 
     print(
         f"Training complete: final_step={step} best_step={best_step} "
-        f"best_val_event_rmse={best_val_event.get('rmse_log_norm', float('nan')):.6f}"
+        f"best_val_event_rmse={best_score:.6f}"
     )
     return 0
 
 
-# Helpers functiosn
+# Helper functions
+
+@torch.no_grad()
+def _normalized_log_rmse(model, loader, device: torch.device) -> float:
+    """Compute only the normalized-log RMSE used for checkpoint selection."""
+    model.eval()
+    squared_error = 0.0
+    pixels = 0
+    for inputs, targets in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        predictions = model(inputs)
+        if predictions.shape != targets.shape:
+            raise ValueError(
+                f"Model output shape {predictions.shape} != target shape {targets.shape}"
+            )
+        squared_error += float((predictions - targets).pow(2).sum())
+        pixels += int(targets.numel())
+    if pixels == 0:
+        raise RuntimeError("Cannot select a checkpoint on an empty validation split.")
+    return math.sqrt(squared_error / pixels)
+
 
 def _autocast(device: torch.device):
     if device.type == "cuda":
@@ -251,14 +286,16 @@ def _part(parts: dict[str, torch.Tensor], key: str) -> float:
     return float(v.detach().cpu()) if v is not None else float("nan")
 
 
-def _save_checkpoint(path: Path, *, model, optimizer, config, step, epoch,
-                     val_event, val_all) -> None:
+def _save_checkpoint(
+    path: Path, *, model, optimizer, config, step, epoch, validation,
+) -> None:
     torch.save({
-        "step": step, "epoch": epoch,
+        "step": step,
+        "epoch": epoch,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "run_config": config,
-        "val_event": val_event, "val_all": val_all,
+        "validation": validation,
     }, path)
 
 

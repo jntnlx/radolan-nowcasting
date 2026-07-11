@@ -12,8 +12,6 @@
 
 ![baseline_sample](plots/forecast_val_event_idx00999.png)
 
-![radial_psd_tmp](plots/radial_psd_val_event_idx00999.png)
-
 ---
 
 ### Acknowledgments
