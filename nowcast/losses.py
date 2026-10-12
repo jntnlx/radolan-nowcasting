@@ -52,22 +52,30 @@ def multiscale_crps(
     valid: torch.Tensor,
     scales: tuple[int, ...] = (1, 4, 16, 64),
     alpha: float = 0.95,
+    power: float | None = None,
 ) -> dict[str, torch.Tensor]:
     """
-    Mean CRPS (in y = log(1 + R)) of area-mean rain rates at several scales (km).
+    Mean CRPS of area-mean rain rates at several scales (km).
+
+    The score is computed for y = log(1 + R), or for R**power if `power` is
+    given. The choice of transform g sets the threshold weighting: the CRPS of
+    g(R) is the Brier score integrated over thresholds r with weight g'(r),
+    i.e. 1 / (1 + r) for log(1 + R) and ~ r**(power - 1) for R**power, which
+    gives heavy rain relatively more weight for power closer to 1.
 
     forecast: (B, M, K, H, W) ensemble in y;  target: (B, K, H, W) in y;
     valid: (B, K, H, W) bool, where the target has radar coverage.
     """
     members = forecast.movedim(1, 0)
+    transform = rate_to_y if power is None else (lambda rate: rate.clamp(min=0) ** power)
     scores = {}
     for scale in scales:
-        if scale == 1:
+        if scale == 1 and power is None:
             pred, obs, ok = members, target, valid
         else:
             pred, _ = pool_rate(y_to_rate(members), valid, scale)
             obs, ok = pool_rate(y_to_rate(target), valid, scale)
-            pred, obs = rate_to_y(pred), rate_to_y(obs)
+            pred, obs = transform(pred), transform(obs)
         score = crps_ensemble(pred, obs, alpha)
         scores[f"crps_{scale}km"] = (score * ok).sum() / ok.sum().clamp(min=1)
     scores["crps"] = torch.stack([scores[f"crps_{s}km"] for s in scales]).mean()

@@ -41,6 +41,9 @@ def parse_args(argv=None):
     p.add_argument("--scales", type=int, nargs="+", default=(1, 4, 16, 64))
     p.add_argument("--motion-weight", type=float, default=0.1)
     p.add_argument("--smooth-weight", type=float, default=0.01)
+    p.add_argument("--heavy-weight", type=float, default=0.0,
+                   help="weight of an extra CRPS of R**heavy_power (threshold weighting towards heavy rain)")
+    p.add_argument("--heavy-power", type=float, default=0.5)
     p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--val-every", type=int, default=1000)
     p.add_argument("--val-samples", type=int, default=256)
@@ -74,6 +77,11 @@ def objective(model, batch, args, members=None, alpha=None):
     )
     scores["smoothness"] = smoothness(out["velocity"])
     scores["loss"] = scores["crps"] + args.motion_weight * scores["motion"] + args.smooth_weight * scores["smoothness"]
+    if args.heavy_weight > 0:
+        scores["crps_heavy"] = multiscale_crps(out["forecast"], batch["targets"], batch["target_valid"],
+                                               scales=tuple(args.scales), alpha=args.alpha if alpha is None else alpha,
+                                               power=args.heavy_power)["crps"]
+        scores["loss"] = scores["loss"] + args.heavy_weight * scores["crps_heavy"]
     scores["speed_kmh"] = 12 * out["velocity"].norm(dim=2).mean()
     return scores
 

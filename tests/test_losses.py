@@ -68,3 +68,15 @@ def test_motion_consistency_cannot_be_gamed_by_leaving_the_domain():
     true[:, 0] = 2.0
     assert float(motion_consistency(frames, valid, departure_points(away, 5))) > 10 * float(
         motion_consistency(frames, valid, departure_points(true, 5)))
+
+
+def test_power_transform_crps_vanishes_for_perfect_forecast_and_weights_heavy_rain():
+    target = torch.zeros(1, 1, 16, 16)
+    target[..., :8, :] = torch.log1p(torch.tensor(20.0))  # heavy rain on half the field
+    valid = torch.ones_like(target, dtype=torch.bool)
+    perfect = target[:, None].expand(1, 2, 1, 16, 16)
+    assert float(multiscale_crps(perfect, target, valid, scales=(1, 4), power=0.5)["crps"]) < 1e-6
+    weak = perfect * 0.5  # heavy rain underestimated
+    log_score = float(multiscale_crps(weak, target, valid, scales=(1,))["crps"])
+    sqrt_score = float(multiscale_crps(weak, target, valid, scales=(1,), power=0.5)["crps"])
+    assert sqrt_score > log_score  # the square-root transform penalizes the heavy-rain error more
