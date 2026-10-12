@@ -51,3 +51,13 @@ def test_spectrum_of_single_wave():
     field = torch.sin(2 * torch.pi * 8 * x / n)[None].expand(n, n)
     spectrum = radial_spectrum(field)
     assert int(spectrum.argmax()) == 8
+
+
+def test_spectra_accumulate_despite_coverage_gaps():
+    obs = rain((2, 1024, 832), 3)
+    obs[:, 300:310, 300:400] = float("nan")  # an outage inside the spectrum window
+    scores = Scores(leads=2, members=1, device="cpu")
+    scores.add(torch.nan_to_num(obs)[None], obs)
+    s = scores.summary()
+    ratio = torch.tensor(s["spectrum_fcst"][0][1:]) / torch.tensor(s["spectrum_obs"][0][1:])
+    assert torch.allclose(ratio, torch.ones_like(ratio))  # perfect forecast: identical masked spectra

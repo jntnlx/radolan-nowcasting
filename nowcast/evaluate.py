@@ -155,10 +155,21 @@ def main(argv=None):
             history, obs, context = load_case(year, t0)
             record(forecaster(history, context, seed=t0), obs, year, t0)
     else:
+        # At most 2 x workers forecasts in flight: fast baselines would otherwise
+        # pile up all results in memory while scoring catches up.
         with ProcessPoolExecutor(args.workers) as pool:
-            futures = [pool.submit(_baseline, args.method, y, t, members) for y, t in todo]
-            for i, (year, t0) in enumerate(todo):
-                forecast, futures[i] = futures[i].result(), None  # release each ~1 GB ensemble once scored
+            queue, pending = iter(todo), {}
+
+            def submit():
+                case = next(queue, None)
+                if case is not None:
+                    pending[case] = pool.submit(_baseline, args.method, *case, members)
+
+            for _ in range(2 * args.workers):
+                submit()
+            for year, t0 in todo:
+                forecast = pending.pop((year, t0)).result()
+                submit()
                 record(forecast, load_case(year, t0)[1], year, t0)
                 del forecast
 

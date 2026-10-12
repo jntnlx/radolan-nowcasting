@@ -6,7 +6,8 @@ Summarize an evaluation population: score table, lead-time figure, paired differ
 
 Paired differences use the per-case CRPS of methods scored on identical cases.
 Their 95% intervals come from a bootstrap over calendar days (cases on the same
-day share weather and are not independent).
+day share weather and are not independent). Evaluations still in progress
+(<method>.partial.pt) enter the paired comparison only, on the cases they share.
 """
 
 import argparse
@@ -15,10 +16,11 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from nowcast.plots import scores_figure
+from nowcast.plots import calibration_figure, scores_figure
 
 LEADS_SHOWN = (6, 12, 24)  # 30, 60, 120 min
 
@@ -47,6 +49,7 @@ def main():
     results = {f.stem: json.loads(f.read_text()) for f in sorted(args.directory.glob("*.json"))}
     out = args.out or args.directory
     scores_figure({k: v["summary"] for k, v in results.items()}, out / "scores.png")
+    calibration_figure({k: v["summary"] for k, v in results.items()}, path=out / "calibration.png")
 
     rows = [("CRPS y 1 km", "crps_y_1km"), ("CRPS y 16 km", "crps_y_16km"), ("CRPS mm/h", "crps_mmh"),
             ("FSS 5 mm/h 21 km", "fss_5.0_21km"), ("BSS 5 mm/h", "bss_5.0"), ("freq. bias 5 mm/h", "freq_bias_5.0")]
@@ -61,15 +64,21 @@ def main():
         s = r["summary"]
         print(name, " ".join(f"{label}@60={s[key][11]:.3f}" for label, key in rows[2:]))
 
-    if args.reference in results:
-        print(f"\nPaired CRPS differences vs {args.reference} (negative = better), 95% day-block bootstrap:")
-        for name, r in results.items():
-            if name == args.reference:
+    paired = dict(results)
+    for f in sorted(args.directory.glob("*.partial.pt")):
+        name = f.name.removesuffix(".partial.pt")
+        if name not in paired:
+            paired[f"{name} (partial)"] = {"cases": torch.load(f, map_location="cpu", weights_only=False)["cases"]}
+    reference = args.reference if args.reference in paired else f"{args.reference} (partial)"
+    if reference in paired:
+        print(f"\nPaired CRPS differences vs {reference} (negative = better), 95% day-block bootstrap:")
+        for name, r in paired.items():
+            if name == reference:
                 continue
             for key in ("crps_y_1km", "crps_y_16km"):
                 parts = []
                 for k in LEADS_SHOWN:
-                    mean, (lo, hi), n = paired_difference(r, results[args.reference], key, k - 1)
+                    mean, (lo, hi), n = paired_difference(r, paired[reference], key, k - 1)
                     parts.append(f"@{5 * k}: {mean:+.4f} [{lo:+.4f}, {hi:+.4f}]")
                 print(f"  {name:20s} {key:12s} " + "  ".join(parts) + f"  (n={n})")
 

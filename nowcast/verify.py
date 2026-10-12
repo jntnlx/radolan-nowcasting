@@ -21,8 +21,11 @@ Scores
                 Calibrated: mse = (M + 1) / M * variance.
     Rank        rank histogram of observations within the ensemble (in y, at
                 pixels where observation or any member is wet).
-    Spectrum    radially averaged power spectrum of y on a fully covered
-                512 x 512 km window, for observations and member 0.
+    Spectrum    radially averaged power spectrum of y on the central 512 x 512 km
+                window, for observations and member 0. Radar outages leave gaps
+                in any large window, so both fields are multiplied by the same
+                observed coverage mask (cases with < 90% coverage are skipped);
+                gap artifacts then largely cancel in the forecast/observed ratio.
 """
 
 import math
@@ -37,7 +40,8 @@ CRPS_SCALES = (1, 4, 16, 64)
 THRESHOLDS = (0.5, 1.0, 5.0, 10.0, 20.0)  # mm/h
 FSS_THRESHOLDS = (1.0, 5.0, 10.0)
 FSS_WINDOWS = (1, 5, 11, 21, 41)          # km
-SPECTRUM_WINDOW = (slice(256, 768), slice(160, 672))  # inside permanent radar coverage
+SPECTRUM_WINDOW = (slice(256, 768), slice(160, 672))  # central 512 km; ~96% covered on average
+SPECTRUM_MIN_COVERAGE = 0.9
 
 
 def _fractions(binary: torch.Tensor, valid: torch.Tensor, n: int) -> torch.Tensor:
@@ -151,9 +155,11 @@ class Scores:
                 self.rank[r, sl] += lead((rank == r) & wet)
 
         rows, cols = SPECTRUM_WINDOW
-        if obs.shape[-2] >= rows.stop and obs.shape[-1] >= cols.stop and bool(valid[:, rows, cols].all()):
-            self.spectrum_obs[:, sl] += radial_spectrum(y_o[:, rows, cols]).double().T
-            self.spectrum_fcst[:, sl] += radial_spectrum(y_f[0, :, rows, cols]).double().T
+        if obs.shape[-2] >= rows.stop and obs.shape[-1] >= cols.stop:
+            mask = valid[:, rows, cols].float()
+            if float(mask.mean()) >= SPECTRUM_MIN_COVERAGE:
+                self.spectrum_obs[:, sl] += radial_spectrum(y_o[:, rows, cols] * mask).double().T
+                self.spectrum_fcst[:, sl] += radial_spectrum(y_f[0, :, rows, cols] * mask).double().T
 
     def summary(self) -> dict:
         """Pooled scores, each a list over lead times (or nested by threshold / window)."""

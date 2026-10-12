@@ -144,3 +144,60 @@ def scores_figure(results: dict[str, dict], path: Path | None = None):
 
 def load_results(directory: Path) -> dict[str, dict]:
     return {p.stem: json.loads(p.read_text())["summary"] for p in sorted(Path(directory).glob("*.json"))}
+
+
+def calibration_figure(results: dict[str, dict], lead: int = 12, threshold: float = 5.0, path: Path | None = None):
+    """
+    Calibration and sharpness at one lead time (index `lead` 1-based, default +60 min):
+    reliability of P(R > threshold), rank histogram, spread vs. error over leads,
+    and the power spectrum of member 0 relative to the observations.
+    """
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4))
+    k = lead - 1
+    ax = axes[0]
+    ax.plot([0, 1], [0, 1], color="k", lw=0.8)
+    for name, s in results.items():
+        rel = s.get(f"reliability_{threshold}")
+        if rel is None or s["members"] == 1:
+            continue
+        freq = np.array(rel["observed_frequency"][k], dtype=float)
+        n = np.array(rel["pixels"][k], dtype=float)
+        prob = np.arange(len(freq)) / (len(freq) - 1)
+        ok = n > 1000
+        ax.plot(prob[ok], freq[ok], marker="o", ms=3, label=name, **METHOD_STYLE.get(name, {}))
+    ax.set(title=f"reliability, P(R > {threshold:g} mm/h), +{5 * lead} min", xlabel="forecast probability", ylabel="observed frequency")
+
+    ax = axes[1]
+    for name, s in results.items():
+        if "rank_histogram" in s:
+            hist = np.array(s["rank_histogram"][k])
+            ax.plot(np.linspace(0, 1, len(hist)), hist * len(hist), label=name, **METHOD_STYLE.get(name, {}))
+    ax.axhline(1, color="k", lw=0.8)
+    ax.set(title=f"rank histogram, +{5 * lead} min (flat = calibrated)", xlabel="normalized rank", ylabel="relative frequency")
+
+    ax = axes[2]
+    for name, s in results.items():
+        if "spread_y" in s:
+            ratio = np.array(s["spread_y"]) / np.array(s["rmse_mean_y"])
+            ax.plot(5 * np.arange(1, len(ratio) + 1), ratio, label=name, **METHOD_STYLE.get(name, {}))
+    ax.axhline(1, color="k", lw=0.8)
+    ax.set(title="spread / error of the ensemble mean (1 = calibrated)", xlabel="lead time (min)")
+
+    ax = axes[3]
+    for name, s in results.items():
+        obs, fcst = np.array(s["spectrum_obs"][k]), np.array(s["spectrum_fcst"][k])
+        if obs.sum() == 0:
+            continue
+        wavelength = 512 / np.arange(1, len(obs))  # km, on the 512 km spectrum window
+        ax.loglog(wavelength, fcst[1:] / obs[1:], label=name, **METHOD_STYLE.get(name, {}))
+    ax.axhline(1, color="k", lw=0.8)
+    ax.invert_xaxis()
+    ax.set(title=f"power spectrum / observed, +{5 * lead} min", xlabel="wavelength (km)")
+    for ax in axes:
+        ax.grid(alpha=0.3)
+    axes[0].legend(fontsize=8)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+    return fig
