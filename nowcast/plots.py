@@ -54,20 +54,41 @@ def show_rain(ax, rate, title=None, window=None):
     _map(ax, title)
 
 
+PROB_CMAP = matplotlib.colormaps["Purples"].copy()
+PROB_CMAP.set_under("white")
+
+
+def show_probability(ax, probability, observed_event, title=None):
+    """Exceedance probability (H, W) with the observed exceedance outlined."""
+    ax.imshow(np.ma.masked_less(probability, 0.05), origin="lower", extent=EXTENT, transform=RADOLAN_CRS,
+              cmap=PROB_CMAP, vmin=0.05, vmax=1, interpolation="nearest")
+    ax.contour(observed_event.astype(float), levels=[0.5], origin="lower", extent=EXTENT, transform=RADOLAN_CRS,
+               colors="#d95f02", linewidths=0.5)
+    _map(ax, title)
+
+
 def case_figure(time: str, history: np.ndarray, obs: np.ndarray, forecasts: dict[str, np.ndarray],
-                leads=(6, 12, 24), velocity: np.ndarray | None = None, path: Path | None = None):
+                leads=(6, 12, 24), velocity: np.ndarray | None = None, path: Path | None = None,
+                probability_threshold: float | None = 5.0):
     """
-    Rows: observation, then two members of each forecast method; columns: lead times.
+    Rows: observation; two members of each forecast method; for ensembles also the
+    probability of exceeding `probability_threshold` (observed exceedance outlined).
+    Columns: lead times.
     history, obs: (T, H, W) mm/h;  forecasts: name -> (M, K, H, W) mm/h;  velocity: (2, h, w) px per step.
     """
-    rows = [("observed", lambda k: obs[k])]
+    rows = [("observed", lambda ax, k, title: show_rain(ax, obs[k], title))]
     for name, f in forecasts.items():
         for m in range(min(2, f.shape[0])):
-            rows.append((f"{name}" + (f" #{m + 1}" if f.shape[0] > 1 else ""), lambda k, f=f, m=m: f[m, k]))
+            rows.append((f"{name}" + (f" #{m + 1}" if f.shape[0] > 1 else ""),
+                         lambda ax, k, title, f=f, m=m: show_rain(ax, f[m, k], title)))
+        if f.shape[0] > 1 and probability_threshold is not None:
+            rows.append((f"{name}\nP(R > {probability_threshold:g} mm/h)",
+                         lambda ax, k, title, f=f: show_probability(ax, (f[:, k] > probability_threshold).mean(0),
+                                                                    np.nan_to_num(obs[k]) > probability_threshold, title)))
     cols = len(leads) + 1
     fig, axes = plt.subplots(len(rows), cols, figsize=(2.2 * cols, 2.6 * len(rows)),
                              subplot_kw={"projection": RADOLAN_CRS}, squeeze=False)
-    for r, (label, get) in enumerate(rows):
+    for r, (label, get) in enumerate(rows):  # get(ax, lead index, title) draws one panel
         if r == 0:
             show_rain(axes[0, 0], history[-1], f"analysis {time} UTC")
             if velocity is not None:
@@ -83,7 +104,7 @@ def case_figure(time: str, history: np.ndarray, obs: np.ndarray, forecasts: dict
             axes[r, 0].axis("off")
             axes[r, 0].text(0.5, 0.5, label, ha="center", va="center", transform=axes[r, 0].transAxes, fontsize=10)
         for c, k in enumerate(leads, start=1):
-            show_rain(axes[r, c], get(k - 1), f"+{5 * k} min" if r == 0 else None)
+            get(axes[r, c], k - 1, f"+{5 * k} min" if r == 0 else None)
     cbar = fig.colorbar(plt.cm.ScalarMappable(norm=RAIN_NORM, cmap=RAIN_CMAP), ax=axes, shrink=0.4, pad=0.02)
     cbar.set_label("rain rate (mm/h)")
     if path:

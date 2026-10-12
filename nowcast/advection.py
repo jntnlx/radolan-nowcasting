@@ -76,6 +76,7 @@ def inside(position: torch.Tensor, height: int, width: int) -> torch.Tensor:
     return (x >= 0) & (x <= width - 1) & (y >= 0) & (y <= height - 1)
 
 
+@torch.compiler.disable  # an inner optimization loop: runs eagerly inside compiled models
 def estimate_velocity(
     history: torch.Tensor,
     valid: torch.Tensor,

@@ -145,8 +145,8 @@ class Season:
         root = zarr.open_group(self.path, mode="r")
         self.present = root["present"][:]
         self.n_radars = root["n_radars"][:]
-        self.tile_rain = root["tile_rain"][:].astype(np.float32)
-        self.tile_valid = root["tile_valid"][:].astype(np.float32)
+        self.tile_rain = root["tile_rain"][:]    # float16 as stored; cast slices before arithmetic
+        self.tile_valid = root["tile_valid"][:]
         self._depth = None  # opened lazily so the object can be sent to DataLoader workers
 
     def __len__(self) -> int:

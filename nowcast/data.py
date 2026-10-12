@@ -57,7 +57,7 @@ class Windows:
         times, weights = [], []
         for s, season in enumerate(self.seasons):
             t0 = season.complete_windows(history, leads)
-            rain, valid = season.tile_rain[t0], season.tile_valid[t0]
+            rain, valid = season.tile_rain[t0].astype(np.float32), season.tile_valid[t0].astype(np.float32)
             domain_rain = (rain * valid).sum((1, 2)) / valid.sum((1, 2)).clip(min=1e-6)
             keep = valid.mean((1, 2)) >= min_valid
             times.append(np.stack([np.full(keep.sum(), s), t0[keep]], axis=1))
@@ -71,7 +71,7 @@ class Windows:
         s, t0 = self.times[rng.choice(len(self.times), p=self.time_weights)]
         season = self.seasons[s]
         h, w = self.crop_tiles
-        rain, valid = season.tile_rain[t0], season.tile_valid[t0]
+        rain, valid = season.tile_rain[t0].astype(np.float32), season.tile_valid[t0].astype(np.float32)
         crop_rain = np.array([(rain[r:r + h, c:c + w] * valid[r:r + h, c:c + w]).sum()
                               / max(valid[r:r + h, c:c + w].sum(), 1e-6) for r, c in self.offsets])
         p = self.floor + crop_rain

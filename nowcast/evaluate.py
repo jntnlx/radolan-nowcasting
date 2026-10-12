@@ -48,7 +48,8 @@ def analysis_times(years, cases: int, seed: int = 2024) -> list[tuple[int, int]]
         s = Season(year)
         t0 = s.complete_windows(HISTORY, LEADS)
         t0 = t0[t0 % STEPS_PER_HOUR == 0]  # analysis time (last observed frame) on the full hour
-        domain = (s.tile_rain[t0] * s.tile_valid[t0]).sum((1, 2)) / s.tile_valid[t0].sum((1, 2)).clip(min=1e-6)
+        rain, valid = s.tile_rain[t0].astype(np.float32), s.tile_valid[t0].astype(np.float32)
+        domain = (rain * valid).sum((1, 2)) / valid.sum((1, 2)).clip(min=1e-6)
         pool += [(year, int(t)) for t in t0[domain >= MIN_DOMAIN_RAIN]]
     rng = np.random.default_rng(seed)
     chosen = rng.choice(len(pool), size=min(cases, len(pool)), replace=False)
@@ -85,7 +86,8 @@ class NetworkForecaster:
         state = torch.load(checkpoint, map_location="cuda", weights_only=False)
         args = state["args"]
         self.model = Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
-                               optical_flow=not args.get("no_optical_flow", True)).cuda().eval()
+                               optical_flow=not args.get("no_optical_flow", True),
+                               noise=args.get("noise", "concat")).cuda().eval()
         self.model.load_state_dict(state["model"])
         self.members, self.chunk = members, chunk
         self.generator = torch.Generator(device="cuda")
@@ -96,10 +98,11 @@ class NetworkForecaster:
         y = torch.log1p(torch.from_numpy(np.nan_to_num(history, nan=0.0))).cuda()[None]
         ctx = torch.from_numpy(context).cuda()[None]
         self.generator.manual_seed(seed)
+        prior = self.model.first_guess(y, valid)
         out = []
         for _ in range(0, self.members, self.chunk):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                f = self.model(y, valid, ctx, members=self.chunk, generator=self.generator)["forecast"]
+                f = self.model(y, valid, ctx, members=self.chunk, generator=self.generator, prior=prior)["forecast"]
             out.append(y_to_rate(f[0].float()))
         return torch.cat(out)[:self.members]
 
@@ -154,8 +157,10 @@ def main(argv=None):
     else:
         with ProcessPoolExecutor(args.workers) as pool:
             futures = [pool.submit(_baseline, args.method, y, t, members) for y, t in todo]
-            for (year, t0), future in zip(todo, futures):
-                record(future.result(), load_case(year, t0)[1], year, t0)
+            for i, (year, t0) in enumerate(todo):
+                forecast, futures[i] = futures[i].result(), None  # release each ~1 GB ensemble once scored
+                record(forecast, load_case(year, t0)[1], year, t0)
+                del forecast
 
     per_case.sort(key=lambda c: (c["year"], c["t0"]))
     result = {"method": args.method, "population": population, "summary": scores.summary(), "cases": per_case}

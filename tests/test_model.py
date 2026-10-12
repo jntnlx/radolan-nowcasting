@@ -6,7 +6,7 @@ from nowcast.model import Nowcaster
 
 
 def small_model(optical_flow=False):
-    return Nowcaster(history=4, leads=5, widths=(8, 16, 16, 32), depths=(1, 1, 1, 1), noise_levels=(2, 3), c_cond=16,
+    return Nowcaster(history=4, leads=5, widths=(8, 16, 16, 32), depths=(1, 1, 1, 1), noise_levels=(1, 3), c_cond=16,
                      velocity_level=2, optical_flow=optical_flow)
 
 
@@ -22,10 +22,12 @@ def test_untrained_network_without_flow_is_eulerian_persistence():
     assert torch.allclose(out["forecast"], latest[:, None, None].expand_as(out["forecast"]), atol=1e-5)
 
 
-def test_members_differ_once_heads_are_trained():
+def test_members_differ_once_trained():
     model = small_model()
-    torch.nn.init.normal_(model.source_head.weight, std=0.1)
-    torch.nn.init.normal_(model.velocity_head.weight, std=0.1)
+    torch.manual_seed(1)
+    with torch.no_grad():  # stand-in for training: zero-initialized layers become non-zero
+        for p in model.parameters():
+            p.add_(0.05 * torch.randn_like(p))
     f = model(*inputs(), members=2)["forecast"]
     assert (f[:, 0] - f[:, 1]).abs().mean() > 1e-3
     assert (f >= 0).all()  # log(1 + R) of a non-negative rain rate

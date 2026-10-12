@@ -49,6 +49,7 @@ def parse_args(argv=None):
     p.add_argument("--compile", action="store_true")
     p.add_argument("--eulerian", action="store_true", help="ablation: disable advection")
     p.add_argument("--no-optical-flow", action="store_true", help="ablation: motion from the network only")
+    p.add_argument("--noise", choices=("film", "concat"), default="film")
     p.add_argument("--train-years", type=int, nargs="+", default=TRAIN_YEARS)
     p.add_argument("--val-years", type=int, nargs="+", default=VAL_YEARS)
     return p.parse_args(argv)
@@ -119,7 +120,7 @@ def main(argv=None):
                             num_workers=args.workers)
 
     model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian,
-                      optical_flow=not args.no_optical_flow).to(device)
+                      optical_flow=not args.no_optical_flow, noise=args.noise).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"{args.run}: {n_params / 1e6:.1f} M parameters, {len(train_windows.times)} training analysis times", flush=True)
