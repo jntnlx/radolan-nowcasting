@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Training runs, checkpoints and evaluation outputs (large, local).
+# Curated figures and score summaries are copied to docs/.
+runs/
+*.pt
+
+# Local leftovers of the v1 prototype
+plots/
+doc/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+*~

@@ -1,0 +1,125 @@
+"""
+Figures: case studies on the radar domain and lead-time score curves.
+
+Maps are drawn in the native RADOLAN polar-stereographic projection
+(spherical earth, R = 6370.04 km, true scale at 60 N, central meridian 10 E),
+so pixels are shown exactly as stored.
+"""
+
+import json
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from matplotlib.colors import BoundaryNorm, ListedColormap  # noqa: E402
+
+from .config import DOMAIN_ORIGIN, DOMAIN_SHAPE  # noqa: E402
+
+RADOLAN_CRS = ccrs.Stereographic(central_latitude=90, central_longitude=10, true_scale_latitude=60,
+                                 globe=ccrs.Globe(semimajor_axis=6370040, semiminor_axis=6370040))
+GRID_ORIGIN_KM = (-443.462, -4758.645)  # RADOLAN 1100 x 900 grid, x and y of pixel (0, 0)
+EXTENT = [1e3 * (GRID_ORIGIN_KM[0] + DOMAIN_ORIGIN[1]), 1e3 * (GRID_ORIGIN_KM[0] + DOMAIN_ORIGIN[1] + DOMAIN_SHAPE[1]),
+          1e3 * (GRID_ORIGIN_KM[1] + DOMAIN_ORIGIN[0]), 1e3 * (GRID_ORIGIN_KM[1] + DOMAIN_ORIGIN[0] + DOMAIN_SHAPE[0])]
+
+RAIN_LEVELS = [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100]  # mm/h
+RAIN_CMAP = ListedColormap(["#c6dbef", "#6baed6", "#2171b5", "#08306b", "#41ab5d", "#fed976", "#fd8d3c", "#e31a1c", "#800026"])
+RAIN_CMAP.set_under("white")
+RAIN_CMAP.set_bad("#e5e5e5")  # no radar data
+RAIN_NORM = BoundaryNorm(RAIN_LEVELS + [1000], RAIN_CMAP.N)
+
+METHOD_STYLE = {
+    "persistence": dict(color="#999999", ls=":"),
+    "extrapolation": dict(color="#555555", ls="--"),
+    "steps": dict(color="#d95f02", ls="-"),
+}
+
+
+def _map(ax, title=None):
+    ax.set_extent(EXTENT, crs=RADOLAN_CRS)
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), lw=0.4, edgecolor="#333333")
+    ax.add_feature(cfeature.COASTLINE.with_scale("50m"), lw=0.4, edgecolor="#333333")
+    if title:
+        ax.set_title(title, fontsize=8)
+
+
+def show_rain(ax, rate, title=None, window=None):
+    """rate: (H, W) mm/h on the model domain (NaN = no data)."""
+    ax.imshow(np.ma.masked_invalid(rate), origin="lower", extent=EXTENT, transform=RADOLAN_CRS,
+              cmap=RAIN_CMAP, norm=RAIN_NORM, interpolation="nearest")
+    _map(ax, title)
+
+
+def case_figure(time: str, history: np.ndarray, obs: np.ndarray, forecasts: dict[str, np.ndarray],
+                leads=(6, 12, 24), velocity: np.ndarray | None = None, path: Path | None = None):
+    """
+    Rows: observation, then two members of each forecast method; columns: lead times.
+    history, obs: (T, H, W) mm/h;  forecasts: name -> (M, K, H, W) mm/h;  velocity: (2, h, w) px per step.
+    """
+    rows = [("observed", lambda k: obs[k])]
+    for name, f in forecasts.items():
+        for m in range(min(2, f.shape[0])):
+            rows.append((f"{name}" + (f" #{m + 1}" if f.shape[0] > 1 else ""), lambda k, f=f, m=m: f[m, k]))
+    cols = len(leads) + 1
+    fig, axes = plt.subplots(len(rows), cols, figsize=(2.2 * cols, 2.6 * len(rows)),
+                             subplot_kw={"projection": RADOLAN_CRS}, squeeze=False)
+    for r, (label, get) in enumerate(rows):
+        if r == 0:
+            show_rain(axes[0, 0], history[-1], f"analysis {time} UTC")
+            if velocity is not None:
+                h, w = velocity.shape[-2:]
+                km = DOMAIN_SHAPE[1] / w  # grid spacing of the velocity field
+                step = max(1, round(32 / km))
+                ys, xs = np.mgrid[0:h:step, 0:w:step]
+                kx = EXTENT[0] + (xs + 0.5) * km * 1e3
+                ky = EXTENT[2] + (ys + 0.5) * km * 1e3
+                axes[0, 0].quiver(kx, ky, velocity[0, ::step, ::step], velocity[1, ::step, ::step],
+                                  transform=RADOLAN_CRS, scale=60, width=0.004, color="k")
+        else:
+            axes[r, 0].axis("off")
+            axes[r, 0].text(0.5, 0.5, label, ha="center", va="center", transform=axes[r, 0].transAxes, fontsize=10)
+        for c, k in enumerate(leads, start=1):
+            show_rain(axes[r, c], get(k - 1), f"+{5 * k} min" if r == 0 else None)
+    cbar = fig.colorbar(plt.cm.ScalarMappable(norm=RAIN_NORM, cmap=RAIN_CMAP), ax=axes, shrink=0.4, pad=0.02)
+    cbar.set_label("rain rate (mm/h)")
+    if path:
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+    return fig
+
+
+def scores_figure(results: dict[str, dict], path: Path | None = None):
+    """Lead-time curves of the main scores; results: name -> summary dict of verify.Scores."""
+    panels = [
+        ("crps_y_1km", "CRPS of log(1+R), 1 km", False),
+        ("crps_y_16km", "CRPS of log(1+R), 16 km mean", False),
+        ("crps_mmh", "CRPS (mm/h), 1 km", False),
+        ("fss_5.0_21km", "FSS, 5 mm/h, 21 km (members)", True),
+        ("bss_5.0", "Brier skill, P(R > 5 mm/h)", True),
+        ("freq_bias_5.0", "frequency bias, 5 mm/h", True),
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7))
+    for ax, (key, title, _) in zip(axes.flat, panels):
+        for name, summary in results.items():
+            values = summary.get(key)
+            if values is None:
+                continue
+            leads = 5 * np.arange(1, len(values) + 1)
+            ax.plot(leads, values, label=name, lw=1.6, **METHOD_STYLE.get(name, {}))
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("lead time (min)")
+        ax.grid(alpha=0.3)
+    axes[0, 0].legend(fontsize=8)
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+    return fig
+
+
+def load_results(directory: Path) -> dict[str, dict]:
+    return {p.stem: json.loads(p.read_text())["summary"] for p in sorted(Path(directory).glob("*.json"))}

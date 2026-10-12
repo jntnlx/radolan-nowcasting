@@ -1,1 +1,0 @@
-"""RADOLAN precipitation nowcasting"""
