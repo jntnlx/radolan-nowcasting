@@ -5,7 +5,7 @@ import math
 import torch
 
 from nowcast.advection import departure_points, grid
-from nowcast.losses import crps_ensemble, motion_consistency, multiscale_crps
+from nowcast.losses import advection_crps, crps_ensemble, motion_consistency, multiscale_crps
 
 
 def gaussian_crps(mu, sigma, y):
@@ -88,3 +88,16 @@ def test_power_transform_has_finite_gradients_at_zero_rain():
     valid = torch.ones_like(target, dtype=torch.bool)
     multiscale_crps(forecast, target, valid, scales=(1, 4), power=0.5)["crps"].backward()
     assert torch.isfinite(forecast.grad).all()
+
+
+def test_advection_crps_prefers_the_true_motion():
+    pos = grid(1, 64, 64)
+    pattern = lambda shift: torch.sin(0.3 * (pos[:, 0] - shift)) * torch.cos(0.2 * pos[:, 1]) + 1
+    latest = pattern(0.0)[:, None]
+    future = torch.stack([pattern(2.0 * k) for k in range(1, 5)], dim=1)  # moves +2 px per step
+    valid = torch.ones_like(future, dtype=torch.bool)
+    true = torch.zeros(2, 2, 64, 64)
+    true[:, 0] = 2.0  # two members, both with the true motion
+    score_true = advection_crps(latest, departure_points(true, 4), future, valid, scales=(1,))
+    score_zero = advection_crps(latest, departure_points(torch.zeros_like(true), 4), future, valid, scales=(1,))
+    assert float(score_true) < 0.1 * float(score_zero)

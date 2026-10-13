@@ -112,6 +112,28 @@ def motion_consistency(inputs: torch.Tensor, valid: torch.Tensor, points: list[t
     return torch.stack(losses).mean()
 
 
+def advection_crps(latest: torch.Tensor, points: list[torch.Tensor], target: torch.Tensor, valid: torch.Tensor,
+                   scales: tuple[int, ...] = (1, 16), alpha: float = 0.95) -> torch.Tensor:
+    """
+    CRPS of the motion-only forecast: the analysis field advected by each member's motion.
+
+    In the full forecast, a growth/decay term can partly compensate a motion
+    error, which dilutes the training signal for the velocity. Scoring pure
+    advection against the future isolates motion: the score is lowest for
+    motion fields that carry the present rain to where the future rain is,
+    and, being a proper ensemble score, for a member spread of the motion
+    that matches the actual displacement uncertainty.
+
+    latest: (B, 1, H, W) analysis field in y; points: K departure points, each
+    (B * M, 2, H, W), member-major; target, valid: (B, K, H, W).
+    """
+    b, k = target.shape[:2]
+    m = points[0].shape[0] // b
+    field = latest.float().repeat_interleave(m, dim=0)
+    advected = torch.cat([sample(field, points[j]) for j in range(k)], dim=1)  # (B * M, K, H, W)
+    return multiscale_crps(advected.reshape(b, m, k, *advected.shape[-2:]), target, valid, scales, alpha)["crps"]
+
+
 def smoothness(velocity: torch.Tensor) -> torch.Tensor:
     """
     Horn-Schunck regularizer: mean squared spatial gradient of the velocity field (..., 2, h, w).

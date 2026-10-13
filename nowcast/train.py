@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from .config import RUNS_DIR, TRAIN_YEARS, VAL_YEARS
 from .data import FixedWindows, RandomWindows, Windows, to_model_space
-from .losses import motion_consistency, multiscale_crps, smoothness
+from .losses import advection_crps, motion_consistency, multiscale_crps, smoothness
 from .model import Nowcaster
 
 
@@ -47,6 +47,8 @@ def parse_args(argv=None):
     p.add_argument("--heavy-weight", type=float, default=0.0,
                    help="weight of an extra CRPS of R**heavy_power (threshold weighting towards heavy rain)")
     p.add_argument("--heavy-power", type=float, default=0.5)
+    p.add_argument("--advection-weight", type=float, default=0.0,
+                   help="weight of the CRPS of the motion-only (advected analysis) forecast")
     p.add_argument("--ema", type=float, default=0.999)
     p.add_argument("--val-every", type=int, default=1000)
     p.add_argument("--val-samples", type=int, default=256)
@@ -87,6 +89,10 @@ def objective(model, batch, args, members=None, alpha=None):
                                                scales=tuple(args.scales), alpha=args.alpha if alpha is None else alpha,
                                                power=args.heavy_power)["crps"]
         scores["loss"] = scores["loss"] + args.heavy_weight * scores["crps_heavy"]
+    if args.advection_weight > 0:
+        scores["crps_advection"] = advection_crps(batch["inputs"][:, -1:], out["points"][:args.leads], batch["targets"],
+                                                  batch["target_valid"], alpha=args.alpha if alpha is None else alpha)
+        scores["loss"] = scores["loss"] + args.advection_weight * scores["crps_advection"]
     scores["speed_kmh"] = 12 * out["velocity"].norm(dim=2).mean()
     return scores
 
