@@ -56,6 +56,8 @@ def parse_args(argv=None):
     p.add_argument("--eulerian", action="store_true", help="ablation: disable advection")
     p.add_argument("--no-optical-flow", action="store_true", help="ablation: motion from the network only")
     p.add_argument("--noise", choices=("film", "concat"), default="film")
+    p.add_argument("--film-levels", type=int, nargs="+", default=(5, 2),
+                   help="noise fields with correlation scales 2^level km (FiLM noise)")
     p.add_argument("--train-years", type=int, nargs="+", default=TRAIN_YEARS)
     p.add_argument("--val-years", type=int, nargs="+", default=VAL_YEARS)
     return p.parse_args(argv)
@@ -139,7 +141,8 @@ def main(argv=None):
                             num_workers=args.workers)
 
     model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian,
-                      optical_flow=not args.no_optical_flow, noise=args.noise).to(device)
+                      optical_flow=not args.no_optical_flow, noise=args.noise,
+                      film_levels=tuple(args.film_levels)).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01)
     best, elapsed_before = math.inf, 0.0

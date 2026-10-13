@@ -88,7 +88,8 @@ class NetworkForecaster:
         args = state["args"]
         self.model = Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
                                optical_flow=not args.get("no_optical_flow", True),
-                               noise=args.get("noise", "concat")).cuda().eval()
+                               noise=args.get("noise", "concat"),
+                               film_levels=tuple(args.get("film_levels", (5, 2)))).cuda().eval()
         self.model.load_state_dict(state["model"])
         self.members, self.chunk, self.history = members, chunk, args["history"]
         self.generator = torch.Generator(device="cuda")

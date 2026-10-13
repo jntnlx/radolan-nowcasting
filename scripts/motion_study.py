@@ -73,7 +73,8 @@ def main():
         state = torch.load(args.checkpoint, map_location="cuda", weights_only=False)
         model = Nowcaster(history=state["args"]["history"], leads=state["args"]["leads"],
                           optical_flow=not state["args"].get("no_optical_flow", False),
-                          noise=state["args"].get("noise", "concat")).cuda().eval()
+                          noise=state["args"].get("noise", "concat"),
+                          film_levels=tuple(state["args"].get("film_levels", (5, 2)))).cuda().eval()
         model.load_state_dict(state["model"])
 
     windows = Windows(VAL_YEARS, 6, 24, (512, 512))

@@ -128,7 +128,8 @@ class Nowcaster(nn.Module):
         depths: tuple[int, ...] = (1, 1, 2, 2, 3, 3),
         noise: str = "film",          # "film": noise modulates every decoder block; "concat": extra input channels (lag_v2)
         noise_channels: int = 8,
-        noise_levels: tuple[int, ...] = (2, 3, 4, 5),  # film: noise fields at the coarsest and finest of these levels
+        noise_levels: tuple[int, ...] = (2, 3, 4, 5),  # concat: levels that receive noise channels
+        film_levels: tuple[int, ...] = (5, 2),         # film: one noise field per level (32 and 4 km)
         c_cond: int = 128,
         velocity_scale: float = 4.0,  # initial sensitivity of the velocity head, px per step
         velocity_level: int = 4,      # velocity on the 2^4 = 16 km grid
@@ -138,6 +139,7 @@ class Nowcaster(nn.Module):
         super().__init__()
         self.history, self.leads = history, leads
         self.noise, self.noise_channels, self.noise_levels = noise, noise_channels, noise_levels
+        self.film_levels = tuple(sorted(film_levels, reverse=True))
         self.velocity_scale = velocity_scale
         self.stride = 2 ** (len(widths) - 1)
 
@@ -152,7 +154,7 @@ class Nowcaster(nn.Module):
         def extra(level):
             return noise_channels if noise == "concat" and level in noise_levels else 0
 
-        c_noise = 2 * noise_channels if noise == "film" else 0
+        c_noise = len(film_levels) * noise_channels if noise == "film" else 0
         top = len(widths) - 1
         self.bottleneck = Level(widths[top] + extra(top), widths[top], depths[top], c_cond, c_noise)
         self.up = nn.ModuleList([nn.Conv2d(widths[i + 1], widths[i], 3, padding=1) for i in range(top)])
@@ -192,15 +194,14 @@ class Nowcaster(nn.Module):
 
     def _noise_fields(self, skips, generator):
         """
-        Noise for FiLM modulation (noise == "film"): two Gaussian fields per member,
-        drawn on the coarsest and the finest noise level (32 and 4 km by default),
+        Noise for FiLM modulation (noise == "film"): one Gaussian field per member and
+        film level, drawn at that level's resolution (correlation scale 2^level km),
         resampled to every decoder level. Returns one tensor per level, or Nones.
         """
         if self.noise != "film":
             return [None] * len(skips)
-        coarse, fine = max(self.noise_levels), min(self.noise_levels)
         fields = [torch.randn((skips[0].shape[0], self.noise_channels, *skips[lvl].shape[-2:]),
-                              device=skips[0].device, dtype=skips[0].dtype, generator=generator) for lvl in (coarse, fine)]
+                              device=skips[0].device, dtype=skips[0].dtype, generator=generator) for lvl in self.film_levels]
         resample = lambda f, size: f if f.shape[-2:] == size else F.interpolate(
             f, size=size, mode="bilinear", align_corners=False, antialias=f.shape[-1] > size[-1])
         return [torch.cat([resample(f, s.shape[-2:]) for f in fields], dim=1) for s in skips]

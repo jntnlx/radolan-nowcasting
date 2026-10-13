@@ -6,7 +6,7 @@ from nowcast.model import Nowcaster
 
 
 def small_model(optical_flow=False):
-    return Nowcaster(history=4, leads=5, widths=(8, 16, 16, 32), depths=(1, 1, 1, 1), noise_levels=(1, 3), c_cond=16,
+    return Nowcaster(history=4, leads=5, widths=(8, 16, 16, 32), depths=(1, 1, 1, 1), noise_levels=(1, 3), film_levels=(3, 1), c_cond=16,
                      velocity_level=2, optical_flow=optical_flow)
 
 
