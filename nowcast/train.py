@@ -2,6 +2,7 @@
 Train the stochastic Lagrangian nowcaster.
 
     python -m nowcast.train --run lagrangian_v1 --hours 8
+    python -m nowcast.train --run lagrangian_v1 --resume   # continue after an interruption
 
 Objective per sample: multiscale almost-fair CRPS of the forecast ensemble,
 plus a small motion-consistency term that ties the velocity field to the
@@ -29,6 +30,8 @@ from .model import Nowcaster
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", required=True)
+    p.add_argument("--resume", action="store_true",
+                   help="continue an interrupted run from its last state (settings are taken from the run)")
     p.add_argument("--hours", type=float, default=1.0, help="wall-clock training budget")
     p.add_argument("--steps", type=int, default=0, help="optimizer steps (0: as many as fit the budget)")
     p.add_argument("--crop", type=int, nargs=2, default=(512, 512))
@@ -110,19 +113,27 @@ def validate(model, loader, args, device, members=4) -> dict[str, float]:
 
 def main(argv=None):
     args = parse_args(argv)
+    run_dir = RUNS_DIR / args.run
+    state = None
+    if args.resume:
+        defaults = vars(parse_args(["--run", args.run]))  # options added since the run started
+        args = argparse.Namespace(**{**defaults, **json.loads((run_dir / "args.json").read_text()), "resume": True})
+        state = torch.load(run_dir / "state.pt", map_location="cpu", weights_only=False)
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    run_dir = RUNS_DIR / args.run
-    run_dir.mkdir(parents=True, exist_ok=False)
-    (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
+    if state is None:
+        run_dir.mkdir(parents=True, exist_ok=False)
+        (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
+    step = state["step"] if state else 0
 
     train_windows = Windows(args.train_years, args.history, args.leads, tuple(args.crop))
     val_windows = Windows(args.val_years, args.history, args.leads, tuple(args.crop))
-    loader = DataLoader(RandomWindows(train_windows, args.seed), batch_size=args.batch,
+    # A resumed run draws a fresh sample stream instead of replaying the first one.
+    loader = DataLoader(RandomWindows(train_windows, args.seed + step), batch_size=args.batch,
                         num_workers=args.workers, pin_memory=True, prefetch_factor=4, persistent_workers=True)
     val_loader = DataLoader(FixedWindows(val_windows, args.val_samples, seed=12345), batch_size=args.batch,
                             num_workers=args.workers)
@@ -130,18 +141,24 @@ def main(argv=None):
     model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian,
                       optical_flow=not args.no_optical_flow, noise=args.noise).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01)
+    best, elapsed_before = math.inf, 0.0
+    if state:
+        model.load_state_dict(state["model"])
+        ema.load_state_dict(state["ema"])
+        optimizer.load_state_dict(state["optimizer"])
+        best, elapsed_before = state["best"], state["elapsed"]
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"{args.run}: {n_params / 1e6:.1f} M parameters, {len(train_windows.times)} training analysis times", flush=True)
+    print(f"{args.run}: {n_params / 1e6:.1f} M parameters, {len(train_windows.times)} training analysis times"
+          + (f", resuming at step {step} after {elapsed_before / 3600:.2f} h" if state else ""), flush=True)
     step_fn = torch.compile(model) if args.compile else model
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01)
     budget = args.hours * 3600
     columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh"]
-    log = open(run_dir / "log.tsv", "w")
-    log.write("\t".join(columns) + "\n")
-    best = math.inf
-    started = time.time()
-    step = 0
+    log = open(run_dir / "log.tsv", "a" if state else "w")
+    if not state:
+        log.write("\t".join(columns) + "\n")
+    started = time.time() - elapsed_before  # the time budget counts training time across sessions
     for raw in loader:
         elapsed = time.time() - started
         progress = max(elapsed / budget, step / args.steps if args.steps else 0.0)
@@ -181,6 +198,10 @@ def main(argv=None):
             if val["val_crps"] < best:
                 best = val["val_crps"]
                 torch.save({"model": ema.state_dict(), "args": vars(args), "step": step, "val": val}, run_dir / "best.pt")
+            # Full training state for --resume, written atomically.
+            torch.save({"model": model.state_dict(), "ema": ema.state_dict(), "optimizer": optimizer.state_dict(),
+                        "step": step, "elapsed": time.time() - started, "best": best}, run_dir / "state.tmp")
+            (run_dir / "state.tmp").replace(run_dir / "state.pt")
 
     final = validate(ema, val_loader, args, device)
     torch.save({"model": ema.state_dict(), "args": vars(args), "step": step, "val": final}, run_dir / "last.pt")

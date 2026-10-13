@@ -29,8 +29,8 @@ def main():
     args = p.parse_args()
 
     year, t0 = time_index(datetime.fromisoformat(args.time))
-    history, obs, context = load_case(year, t0)
     network = NetworkForecaster(args.checkpoint, args.members)
+    history, obs, context = load_case(year, t0, network.history)
     forecasts = {"network": network(history, context, seed=t0).cpu().numpy()}
     with contextlib.redirect_stdout(io.StringIO()):
         if args.steps:

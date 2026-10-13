@@ -56,10 +56,11 @@ def analysis_times(years, cases: int, seed: int = 2024) -> list[tuple[int, int]]
     return sorted(pool[i] for i in chosen)
 
 
-def load_case(year: int, t0: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def load_case(year: int, t0: int, history: int = HISTORY) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rain rates of `history` past frames (ending at t0) and LEADS future frames, and the time context."""
     s = Season(year)
-    rate = depth_to_rate(s.frames(t0 - HISTORY + 1, t0 + LEADS + 1))
-    return rate[:HISTORY], rate[HISTORY:], time_context(s.time(t0))
+    rate = depth_to_rate(s.frames(t0 - history + 1, t0 + LEADS + 1))
+    return rate[:history], rate[history:], time_context(s.time(t0))
 
 
 def _baseline(method: str, year: int, t0: int, members: int) -> np.ndarray:
@@ -89,7 +90,7 @@ class NetworkForecaster:
                                optical_flow=not args.get("no_optical_flow", True),
                                noise=args.get("noise", "concat")).cuda().eval()
         self.model.load_state_dict(state["model"])
-        self.members, self.chunk = members, chunk
+        self.members, self.chunk, self.history = members, chunk, args["history"]
         self.generator = torch.Generator(device="cuda")
 
     @torch.no_grad()
@@ -152,7 +153,7 @@ def main(argv=None):
     if is_network or args.method == "flow":
         forecaster = NetworkForecaster(Path(args.method), members) if is_network else FlowForecaster()
         for year, t0 in todo:
-            history, obs, context = load_case(year, t0)
+            history, obs, context = load_case(year, t0, getattr(forecaster, "history", HISTORY))
             record(forecaster(history, context, seed=t0), obs, year, t0)
     else:
         # At most 2 x workers forecasts in flight: fast baselines would otherwise
