@@ -57,17 +57,19 @@ def multiscale_crps(
     """
     Mean CRPS of area-mean rain rates at several scales (km).
 
-    The score is computed for y = log(1 + R), or for R**power if `power` is
-    given. The choice of transform g sets the threshold weighting: the CRPS of
-    g(R) is the Brier score integrated over thresholds r with weight g'(r),
-    i.e. 1 / (1 + r) for log(1 + R) and ~ r**(power - 1) for R**power, which
-    gives heavy rain relatively more weight for power closer to 1.
+    The score is computed for y = log(1 + R), or for (R + eps)**power - eps**power
+    if `power` is given (eps = 0.01 mm/h keeps the gradient finite at R = 0).
+    The choice of transform g sets the threshold weighting: the CRPS of g(R)
+    is the Brier score integrated over thresholds r with weight g'(r), i.e.
+    1 / (1 + r) for log(1 + R) and ~ r**(power - 1) for the power transform,
+    which gives heavy rain relatively more weight for power closer to 1.
 
     forecast: (B, M, K, H, W) ensemble in y;  target: (B, K, H, W) in y;
     valid: (B, K, H, W) bool, where the target has radar coverage.
     """
     members = forecast.movedim(1, 0)
-    transform = rate_to_y if power is None else (lambda rate: rate.clamp(min=0) ** power)
+    eps = 0.01
+    transform = rate_to_y if power is None else (lambda rate: (rate.clamp(min=0) + eps) ** power - eps**power)
     scores = {}
     for scale in scales:
         if scale == 1 and power is None:

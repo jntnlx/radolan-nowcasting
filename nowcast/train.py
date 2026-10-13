@@ -162,6 +162,7 @@ def main(argv=None):
     if not state:
         log.write("\t".join(columns) + "\n")
     started = time.time() - elapsed_before  # the time budget counts training time across sessions
+    skipped = 0
     for raw in loader:
         elapsed = time.time() - started
         progress = max(elapsed / budget, step / args.steps if args.steps else 0.0)
@@ -178,6 +179,12 @@ def main(argv=None):
         optimizer.zero_grad(set_to_none=True)
         scores["loss"].backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if not torch.isfinite(grad_norm):  # never let one bad batch corrupt the weights
+            skipped += 1
+            print(f"  skipped step {step}: non-finite gradient ({skipped} so far)", flush=True)
+            if skipped > 10:
+                raise FloatingPointError("more than 10 non-finite gradients")
+            continue
         optimizer.step()
         with torch.no_grad():
             decay = min(args.ema, (1 + step) / (10 + step))

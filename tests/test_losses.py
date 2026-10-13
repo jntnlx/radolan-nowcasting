@@ -80,3 +80,11 @@ def test_power_transform_crps_vanishes_for_perfect_forecast_and_weights_heavy_ra
     log_score = float(multiscale_crps(weak, target, valid, scales=(1,))["crps"])
     sqrt_score = float(multiscale_crps(weak, target, valid, scales=(1,), power=0.5)["crps"])
     assert sqrt_score > log_score  # the square-root transform penalizes the heavy-rain error more
+
+
+def test_power_transform_has_finite_gradients_at_zero_rain():
+    target = torch.zeros(1, 1, 8, 8)
+    forecast = torch.zeros(1, 2, 1, 8, 8, requires_grad=True)  # dry forecast, dry observation
+    valid = torch.ones_like(target, dtype=torch.bool)
+    multiscale_crps(forecast, target, valid, scales=(1, 4), power=0.5)["crps"].backward()
+    assert torch.isfinite(forecast.grad).all()
