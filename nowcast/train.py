@@ -15,6 +15,8 @@ import argparse
 import copy
 import json
 import math
+import os
+import threading
 import time
 from pathlib import Path
 
@@ -55,6 +57,12 @@ def parse_args(argv=None):
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--compile", action="store_true")
+    p.add_argument("--correction-max", type=float, default=4.0, help="bound of the learned velocity correction, px per step")
+    p.add_argument("--correction-weight", type=float, default=1e-3,
+                   help="penalty on the tanh argument of the velocity correction (keeps it out of saturation)")
+    p.add_argument("--stall-minutes", type=float, default=15.0, help="abort if no step completes for this long")
+    p.add_argument("--gpu-memory-fraction", type=float, default=0.92,
+                   help="cap on GPU memory: exceeding it raises an error instead of spilling slowly into system RAM")
     p.add_argument("--eulerian", action="store_true", help="ablation: disable advection")
     p.add_argument("--no-optical-flow", action="store_true", help="ablation: motion from the network only")
     p.add_argument("--noise", choices=("film", "concat"), default="film")
@@ -83,7 +91,9 @@ def objective(model, batch, args, members=None, alpha=None):
         out["points"],
     )
     scores["smoothness"] = smoothness(out["velocity"])
-    scores["loss"] = scores["crps"] + args.motion_weight * scores["motion"] + args.smooth_weight * scores["smoothness"]
+    scores["saturation"] = out["correction_raw"].pow(2).mean()
+    scores["loss"] = (scores["crps"] + args.motion_weight * scores["motion"] + args.smooth_weight * scores["smoothness"]
+                      + args.correction_weight * scores["saturation"])
     if args.heavy_weight > 0:
         scores["crps_heavy"] = multiscale_crps(out["forecast"], batch["targets"], batch["target_valid"],
                                                scales=tuple(args.scales), alpha=args.alpha if alpha is None else alpha,
@@ -124,8 +134,10 @@ def main(argv=None):
     run_dir = RUNS_DIR / args.run
     state = None
     if args.resume:
-        defaults = vars(parse_args(["--run", args.run]))  # options added since the run started
-        args = argparse.Namespace(**{**defaults, **json.loads((run_dir / "args.json").read_text()), "resume": True})
+        defaults = vars(parse_args(["--run", args.run]))  # options added since the run started ...
+        legacy = {"correction_max": 10.0, "correction_weight": 0.0}  # ... with their behaviour before they existed
+        saved = json.loads((run_dir / "args.json").read_text())
+        args = argparse.Namespace(**{**defaults, **{k: v for k, v in legacy.items() if k not in saved}, **saved, "resume": True})
         state = torch.load(run_dir / "state.pt", map_location="cpu", weights_only=False)
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
@@ -146,7 +158,8 @@ def main(argv=None):
     val_loader = DataLoader(FixedWindows(val_windows, args.val_samples, seed=12345), batch_size=args.batch,
                             num_workers=args.workers)
 
-    model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian,
+    torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
+    model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian, correction_max=args.correction_max,
                       optical_flow=not args.no_optical_flow, noise=args.noise,
                       film_levels=tuple(args.film_levels)).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
@@ -163,12 +176,25 @@ def main(argv=None):
     step_fn = torch.compile(model) if args.compile else model
 
     budget = args.hours * 3600
-    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh"]
+    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh", "saturation", "gpu_gb"]
     log = open(run_dir / "log.tsv", "a" if state else "w")
     if not state:
         log.write("\t".join(columns) + "\n")
     started = time.time() - elapsed_before  # the time budget counts training time across sessions
     skipped = 0
+
+    # Watchdog: a run that stops making progress (e.g. GPU memory spilling into system RAM,
+    # a hung data worker) is aborted instead of silently consuming its time budget.
+    last_progress = [time.time()]
+
+    def watchdog():
+        while True:
+            time.sleep(30)
+            if time.time() - last_progress[0] > args.stall_minutes * 60:
+                print(f"STALL: no training step for {args.stall_minutes:g} min, aborting", flush=True)
+                os._exit(3)
+
+    threading.Thread(target=watchdog, daemon=True).start()
     for raw in loader:
         elapsed = time.time() - started
         progress = max(elapsed / budget, step / args.steps if args.steps else 0.0)
@@ -197,9 +223,11 @@ def main(argv=None):
             for p_ema, p in zip(ema.parameters(), model.parameters()):
                 p_ema.lerp_(p, 1 - decay)
         step += 1
+        last_progress[0] = time.time()
 
         if step % 50 == 0 or step == 1:
             row = {"step": step, "hours": elapsed / 3600, "lr": optimizer.param_groups[0]["lr"],
+                   "gpu_gb": torch.cuda.max_memory_reserved() / 1e9,
                    "grad_norm": float(grad_norm), **{k: v.item() for k, v in scores.items()}}
             log.write("\t".join(f"{row.get(c, float('nan')):.6g}" for c in columns) + "\n")
             log.flush()
@@ -211,6 +239,7 @@ def main(argv=None):
                 f.write(json.dumps(val) + "\n")
             print(f"  validation: crps={val['val_crps']:.4f} persistence={val['val_persistence_crps']:.4f} "
                   f"skill={val['val_skill']:.3f}", flush=True)
+            last_progress[0] = time.time()  # validation is progress too
             if val["val_crps"] < best:
                 best = val["val_crps"]
                 torch.save({"model": ema.state_dict(), "args": vars(args), "step": step, "val": val}, run_dir / "best.pt")

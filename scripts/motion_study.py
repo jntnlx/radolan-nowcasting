@@ -74,7 +74,8 @@ def main():
         model = Nowcaster(history=state["args"]["history"], leads=state["args"]["leads"],
                           optical_flow=not state["args"].get("no_optical_flow", False),
                           noise=state["args"].get("noise", "concat"),
-                          film_levels=tuple(state["args"].get("film_levels", (5, 2)))).cuda().eval()
+                          film_levels=tuple(state["args"].get("film_levels", (5, 2))),
+                          correction_max=state["args"].get("correction_max", 10.0)).cuda().eval()
         model.load_state_dict(state["model"])
 
     windows = Windows(VAL_YEARS, 6, 24, (512, 512))

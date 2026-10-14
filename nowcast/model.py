@@ -132,6 +132,7 @@ class Nowcaster(nn.Module):
         film_levels: tuple[int, ...] = (5, 2),         # film: one noise field per level (32 and 4 km)
         c_cond: int = 128,
         velocity_scale: float = 4.0,  # initial sensitivity of the velocity head, px per step
+        correction_max: float = V_MAX,  # bound of the learned velocity correction, px per step
         velocity_level: int = 4,      # velocity on the 2^4 = 16 km grid
         eulerian: bool = False,       # ablation: no advection, all change comes from the source term
         optical_flow: bool = True,    # physical first guess of the motion (False: network-only motion)
@@ -140,7 +141,7 @@ class Nowcaster(nn.Module):
         self.history, self.leads = history, leads
         self.noise, self.noise_channels, self.noise_levels = noise, noise_channels, noise_levels
         self.film_levels = tuple(sorted(film_levels, reverse=True))
-        self.velocity_scale = velocity_scale
+        self.velocity_scale, self.correction_max = velocity_scale, correction_max
         self.stride = 2 ** (len(widths) - 1)
 
         self.cond = nn.Sequential(nn.Linear(4, c_cond), nn.SiLU(), nn.Linear(c_cond, c_cond))
@@ -216,9 +217,12 @@ class Nowcaster(nn.Module):
             x = self.decoder[i](torch.cat([x, skips[i], *self._noise(skips[i], i, generator)], dim=1), cond, noise[i])
             if i == self.velocity_level:
                 velocity = self.velocity_head(x)
-        correction = V_MAX * torch.tanh(self.velocity_scale * velocity.float() / V_MAX)
+        # tanh bounds the correction; its argument is returned so that training can
+        # penalize saturation (where tanh has no gradient left to pull it back).
+        raw = self.velocity_scale * velocity.float() / self.correction_max
+        correction = self.correction_max * torch.tanh(raw)
         velocity = torch.zeros_like(correction) if self.eulerian else prior + correction
-        return velocity, self.source_head(x)
+        return velocity, self.source_head(x), raw
 
     def first_guess(self, inputs, valid) -> torch.Tensor:
         """Optical-flow first guess of the velocity (zero without optical flow)."""
@@ -240,7 +244,7 @@ class Nowcaster(nn.Module):
         # Members share the encoding and the first guess; stack them along the batch axis for one decoder pass.
         skips = [s.repeat_interleave(members, dim=0) for s in skips]
         cond = cond.repeat_interleave(members, dim=0)
-        velocity, source = self.decode(skips, cond, prior.repeat_interleave(members, dim=0), generator)
+        velocity, source, raw = self.decode(skips, cond, prior.repeat_interleave(members, dim=0), generator)
         velocity, source = velocity.float(), source.float()
 
         latest = inputs[:, -1:].float().repeat_interleave(members, dim=0)
@@ -257,6 +261,7 @@ class Nowcaster(nn.Module):
         return {
             "forecast": unstack(forecast),
             "velocity": unstack(velocity),
+            "correction_raw": raw,
             "prior": prior,
             "source": unstack(source),
             "points": points,  # (B * M, 2, H, W) each, member-major within sample
