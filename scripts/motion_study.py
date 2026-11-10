@@ -35,7 +35,7 @@ from nowcast import baselines
 from nowcast.advection import departure_points, estimate_velocity, sample
 from nowcast.config import RUNS_DIR, VAL_YEARS
 from nowcast.data import FixedWindows, Windows, to_model_space
-from nowcast.model import Nowcaster
+from nowcast.model import from_checkpoint
 
 LEADS = (6, 12, 24)  # 30, 60, 120 min
 GRID = 16
@@ -71,11 +71,7 @@ def main():
     model = None
     if args.checkpoint:
         state = torch.load(args.checkpoint, map_location="cuda", weights_only=False)
-        model = Nowcaster(history=state["args"]["history"], leads=state["args"]["leads"],
-                          optical_flow=not state["args"].get("no_optical_flow", False),
-                          noise=state["args"].get("noise", "concat"),
-                          film_levels=tuple(state["args"].get("film_levels", (5, 2))),
-                          correction_max=state["args"].get("correction_max", 10.0)).cuda().eval()
+        model = from_checkpoint(state["args"]).cuda().eval()
         model.load_state_dict(state["model"])
 
     windows = Windows(VAL_YEARS, 6, 24, (512, 512))

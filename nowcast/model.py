@@ -23,7 +23,7 @@ from stacked frames (a network trained so learned no usable motion at all).
 The velocity is therefore u = u_0 + du: u_0 is a variational optical flow
 fitted to the observed past inside the forward pass (advection.py,
 `estimate_velocity`; on the full domain as skilful as pysteps' Lucas-Kanade
-extrapolation, at ~0.1 s on the GPU instead of ~13 s on the CPU), and the
+extrapolation, in under a second on the GPU instead of ~13 s on the CPU), and the
 network predicts a bounded correction du, trained on the future, together
 with the members' motion perturbations.
 
@@ -104,6 +104,24 @@ Y_MAX = math.log1p(500.0)  # 500 mm/h: above any rain rate observed in RADKLIM
 V_MAX = 10.0                # px per step = 120 km/h: above any precipitation system motion
 
 
+LEGACY_FLOW = dict(smoothness=0.01, uniform_iterations=0, lr_end=0.3)  # flow layer of runs before lag_v5
+
+
+def from_checkpoint(args: dict) -> "Nowcaster":
+    """
+    Build the network of a training run from its saved arguments.
+
+    Options that did not exist when a run was trained take the behaviour of
+    that time, so every old checkpoint reproduces its forecasts.
+    """
+    flow = LEGACY_FLOW if args.get("flow_smoothness") is None else dict(smoothness=args["flow_smoothness"])
+    return Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
+                     optical_flow=not args.get("no_optical_flow", True),  # lag_v1: network-only motion
+                     noise=args.get("noise", "concat"),                    # lag_v1, lag_v2
+                     film_levels=tuple(args.get("film_levels", (5, 2))),
+                     correction_max=args.get("correction_max", 10.0), flow=flow)
+
+
 def clamp_straight_through(x: torch.Tensor, low: float, high: float) -> torch.Tensor:
     """Physical bounds in the forward pass (exact zeros where dry), identity gradient in the backward pass."""
     return x + (x.clamp(low, high) - x).detach()
@@ -136,6 +154,7 @@ class Nowcaster(nn.Module):
         velocity_level: int = 4,      # velocity on the 2^4 = 16 km grid
         eulerian: bool = False,       # ablation: no advection, all change comes from the source term
         optical_flow: bool = True,    # physical first guess of the motion (False: network-only motion)
+        flow: dict | None = None,     # options of advection.estimate_velocity (None: its defaults)
     ):
         super().__init__()
         self.history, self.leads = history, leads
@@ -168,6 +187,7 @@ class Nowcaster(nn.Module):
         self.velocity_level = velocity_level
         self.eulerian = eulerian
         self.optical_flow = optical_flow and not eulerian
+        self.flow = dict(flow or {})
         self.velocity_head = nn.Conv2d(widths[self.velocity_level], 2, 3, padding=1)
         self.source_head = nn.Conv2d(widths[0], leads, 3, padding=1)
         for head in (self.velocity_head, self.source_head):
@@ -229,7 +249,7 @@ class Nowcaster(nn.Module):
         b, _, h, w = inputs.shape
         grid = 2 ** self.velocity_level
         if self.optical_flow:
-            return estimate_velocity(inputs, valid, grid=grid)
+            return estimate_velocity(inputs, valid, grid=grid, **self.flow)
         return inputs.new_zeros(b, 2, h // grid, w // grid, dtype=torch.float32)
 
     def forward(self, inputs, valid, context, members: int = 2, generator=None, prior=None) -> dict[str, torch.Tensor]:

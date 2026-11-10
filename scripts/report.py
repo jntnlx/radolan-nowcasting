@@ -63,6 +63,15 @@ def main():
     for name, r in results.items():
         s = r["summary"]
         print(name, " ".join(f"{label}@60={s[key][11]:.3f}" for label, key in rows[2:]))
+    print("\nStreakiness (structure-tensor coherence of y in 16 km windows; compare with the observed value) @30/60/120 min,")
+    print("and CRPS of 1 h / 2 h accumulations (y of the mean rate; 1 km, 16 km). Only in evaluations made since 2026-11-10.")
+    for name, r in results.items():
+        s = r["summary"]
+        if "anisotropy_fcst" in s:
+            print(f"  {name:20s} anisotropy " + " / ".join(f"{s['anisotropy_fcst'][k - 1]:.3f}" for k in LEADS_SHOWN)
+                  + "  (observed " + " / ".join(f"{s['anisotropy_obs'][k - 1]:.3f}" for k in LEADS_SHOWN) + ")"
+                  + "  acc 1 h: " + ", ".join(f"{s.get(f'crps_acc60_y_{km}km', float('nan')):.4f}" for km in (1, 16))
+                  + "  acc 2 h: " + ", ".join(f"{s.get(f'crps_acc120_y_{km}km', float('nan')):.4f}" for km in (1, 16)))
 
     paired = dict(results)
     for f in sorted(args.directory.glob("*.partial.pt")):

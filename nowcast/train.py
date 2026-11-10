@@ -3,6 +3,7 @@ Train the stochastic Lagrangian nowcaster.
 
     python -m nowcast.train --run lagrangian_v1 --hours 8
     python -m nowcast.train --run lagrangian_v1 --resume   # continue after an interruption
+    python -m nowcast.train --run lagrangian_v1 --resume --hours 12   # ... with a longer total budget
 
 Objective per sample: multiscale almost-fair CRPS of the forecast ensemble,
 plus a small motion-consistency term that ties the velocity field to the
@@ -25,8 +26,9 @@ from torch.utils.data import DataLoader
 
 from .config import RUNS_DIR, TRAIN_YEARS, VAL_YEARS
 from .data import FixedWindows, RandomWindows, Windows, to_model_space
+from .advection import deformation
 from .losses import advection_crps, motion_consistency, multiscale_crps, smoothness
-from .model import Nowcaster
+from .model import from_checkpoint
 
 
 def parse_args(argv=None):
@@ -34,7 +36,9 @@ def parse_args(argv=None):
     p.add_argument("--run", required=True)
     p.add_argument("--resume", action="store_true",
                    help="continue an interrupted run from its last state (settings are taken from the run)")
-    p.add_argument("--hours", type=float, default=1.0, help="wall-clock training budget")
+    p.add_argument("--hours", type=float, default=None,
+                   help="wall-clock training budget (default 1; with --resume: replaces the run's budget, "
+                        "and the cosine schedule continues on the new time axis)")
     p.add_argument("--steps", type=int, default=0, help="optimizer steps (0: as many as fit the budget)")
     p.add_argument("--crop", type=int, nargs=2, default=(512, 512))
     p.add_argument("--batch", type=int, default=4)
@@ -60,6 +64,11 @@ def parse_args(argv=None):
     p.add_argument("--correction-max", type=float, default=4.0, help="bound of the learned velocity correction, px per step")
     p.add_argument("--correction-weight", type=float, default=1e-3,
                    help="penalty on the tanh argument of the velocity correction (keeps it out of saturation)")
+    p.add_argument("--flow-smoothness", type=float, default=0.1,
+                   help="Horn-Schunck weight of the optical-flow first guess (advection.estimate_velocity)")
+    p.add_argument("--well-weight", type=float, default=0.0,
+                   help="penalty on psi = y0 + S below -well_margin: bounds how deeply dry pixels are suppressed")
+    p.add_argument("--well-margin", type=float, default=1.0)
     p.add_argument("--stall-minutes", type=float, default=15.0, help="abort if no step completes for this long")
     p.add_argument("--gpu-memory-fraction", type=float, default=0.92,
                    help="cap on GPU memory: exceeding it raises an error instead of spilling slowly into system RAM")
@@ -80,8 +89,8 @@ def lr_factor(step: int, progress: float, warmup: int = 1000) -> float:
     return 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * min(progress, 1.0)))
 
 
-def objective(model, batch, args, members=None, alpha=None):
-    out = model(batch["inputs"], batch["input_valid"], batch["context"], members=members or args.members)
+def objective(model, batch, args, members=None, alpha=None, generator=None):
+    out = model(batch["inputs"], batch["input_valid"], batch["context"], members=members or args.members, generator=generator)
     scores = multiscale_crps(out["forecast"], batch["targets"], batch["target_valid"],
                              scales=tuple(args.scales), alpha=args.alpha if alpha is None else alpha)
     m = out["forecast"].shape[1]
@@ -103,7 +112,17 @@ def objective(model, batch, args, members=None, alpha=None):
         scores["crps_advection"] = advection_crps(batch["inputs"][:, -1:], out["points"][:args.leads], batch["targets"],
                                                   batch["target_valid"], alpha=args.alpha if alpha is None else alpha)
         scores["loss"] = scores["loss"] + args.advection_weight * scores["crps_advection"]
+    # Depth of the dry wells: the clamp at y = 0 leaves psi = y0 + S unconstrained below zero
+    # (no gradient once a pixel is dry), and a deeply negative psi cannot be brought back by any noise draw.
+    # Without the penalty this is a diagnostic only, on every 4th pixel (GPU memory is tight).
+    stride = 1 if args.well_weight > 0 else 4
+    psi = batch["inputs"][:, -1, None, None, ::stride, ::stride].float() + out["source"][..., ::stride, ::stride]
+    scores["wells"] = torch.relu(-psi - args.well_margin).mean()
+    if args.well_weight > 0:
+        scores["loss"] = scores["loss"] + args.well_weight * scores["wells"]
     scores["speed_kmh"] = 12 * out["velocity"].norm(dim=2).mean()
+    with torch.no_grad():  # diagnostic: median stretch anisotropy of the trajectory map at the last lead (1 = rigid)
+        scores["stretch"] = deformation(out["points"][args.leads - 1].float())[0].flatten()[::7].median()
     return scores
 
 
@@ -111,10 +130,11 @@ def objective(model, batch, args, members=None, alpha=None):
 def validate(model, loader, args, device, members=4) -> dict[str, float]:
     model.eval()
     totals, persistence, n = {}, {}, 0
+    generator = torch.Generator(device=device).manual_seed(12345)  # the same member noise at every validation
     for raw in loader:
         batch = to_model_space(raw, args.history, device)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            scores = objective(model, batch, args, members=members, alpha=1.0)
+            scores = objective(model, batch, args, members=members, alpha=1.0, generator=generator)
         latest = batch["inputs"][:, -1:].expand_as(batch["targets"])[:, None]
         base = multiscale_crps(latest, batch["targets"], batch["target_valid"], scales=tuple(args.scales))
         for k, v in scores.items():
@@ -135,10 +155,15 @@ def main(argv=None):
     state = None
     if args.resume:
         defaults = vars(parse_args(["--run", args.run]))  # options added since the run started ...
-        legacy = {"correction_max": 10.0, "correction_weight": 0.0}  # ... with their behaviour before they existed
+        legacy = {"correction_max": 10.0, "correction_weight": 0.0, "flow_smoothness": None}  # ... with their behaviour before they existed
         saved = json.loads((run_dir / "args.json").read_text())
+        if args.hours is not None:
+            saved["hours"] = args.hours
+            (run_dir / "args.json").write_text(json.dumps({**saved}, indent=2))
         args = argparse.Namespace(**{**defaults, **{k: v for k, v in legacy.items() if k not in saved}, **saved, "resume": True})
         state = torch.load(run_dir / "state.pt", map_location="cpu", weights_only=False)
+    if args.hours is None:
+        args.hours = 1.0
     torch.manual_seed(args.seed)
     device = torch.device("cuda")
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -159,9 +184,7 @@ def main(argv=None):
                             num_workers=args.workers)
 
     torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
-    model = Nowcaster(history=args.history, leads=args.leads, eulerian=args.eulerian, correction_max=args.correction_max,
-                      optical_flow=not args.no_optical_flow, noise=args.noise,
-                      film_levels=tuple(args.film_levels)).to(device)
+    model = from_checkpoint(vars(args)).to(device)
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01)
     best, elapsed_before = math.inf, 0.0
@@ -176,7 +199,7 @@ def main(argv=None):
     step_fn = torch.compile(model) if args.compile else model
 
     budget = args.hours * 3600
-    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh", "saturation", "gpu_gb"]
+    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh", "saturation", "wells", "stretch", "gpu_gb"]
     log = open(run_dir / "log.tsv", "a" if state else "w")
     if not state:
         log.write("\t".join(columns) + "\n")
@@ -231,7 +254,7 @@ def main(argv=None):
                    "grad_norm": float(grad_norm), **{k: v.item() for k, v in scores.items()}}
             log.write("\t".join(f"{row.get(c, float('nan')):.6g}" for c in columns) + "\n")
             log.flush()
-            print(" ".join(f"{k}={row[k]:.4g}" for k in ("step", "hours", "loss", "crps", "motion", "speed_kmh")), flush=True)
+            print(" ".join(f"{k}={row[k]:.4g}" for k in ("step", "hours", "loss", "crps", "motion", "speed_kmh", "stretch")), flush=True)
 
         if step % args.val_every == 0:
             val = {"step": step, "hours": elapsed / 3600, **validate(ema, val_loader, args, device)}

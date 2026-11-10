@@ -2,7 +2,7 @@
 
 import torch
 
-from nowcast.verify import Scores, radial_spectrum
+from nowcast.verify import Scores, anisotropy_sums, radial_spectrum
 
 
 def rain(shape, seed):
@@ -61,3 +61,30 @@ def test_spectra_accumulate_despite_coverage_gaps():
     s = scores.summary()
     ratio = torch.tensor(s["spectrum_fcst"][0][1:]) / torch.tensor(s["spectrum_obs"][0][1:])
     assert torch.allclose(ratio, torch.ones_like(ratio))  # perfect forecast: identical masked spectra
+
+
+def test_spectrum_ignores_the_corners_beyond_nyquist():
+    n = 64
+    x = torch.arange(n, dtype=torch.float32)
+    diagonal = torch.sin(2 * torch.pi * 30 * (x[:, None] + x[None]) / n)  # |k| = 42 > n / 2
+    spectrum = radial_spectrum(diagonal + 1e-3 * torch.sin(2 * torch.pi * 8 * x / n)[None])
+    assert int(spectrum.argmax()) == 8  # the diagonal wave belongs to no ring (it used to land in the last one)
+
+
+def test_anisotropy_separates_streaks_from_isotropic_texture():
+    torch.manual_seed(0)
+    smooth = lambda t, k: torch.nn.functional.avg_pool2d(t[None, None], k, stride=1, padding=k // 2)[0, 0]
+    valid = torch.ones(128, 128, dtype=torch.bool)
+    coherence = lambda field: float(torch.divide(*anisotropy_sums(field, valid)))
+    isotropic = smooth(torch.randn(128, 128), 5)
+    streaks = torch.nn.functional.avg_pool2d(torch.randn(1, 1, 128, 168), (1, 41), stride=1)[0, 0]  # smeared along x
+    assert coherence(isotropic) < 0.35 < 0.8 < coherence(streaks)
+
+
+def test_accumulation_score_vanishes_for_a_perfect_forecast():
+    obs = rain((24, 64, 64), 5)
+    scores = Scores(leads=24, members=3, device="cpu")
+    scores.add(obs[None].expand(3, -1, -1, -1), obs)
+    s = scores.summary()
+    assert s["crps_acc60_y_1km"] < 1e-6 and s["crps_acc120_y_16km"] < 1e-6
+    assert all(abs(f - o) < 1e-6 for f, o in zip(s["anisotropy_fcst"], s["anisotropy_obs"]))

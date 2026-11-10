@@ -11,10 +11,12 @@ with a fixed seed. Membership depends on the analysis time only, never on
 the future, so no method is favoured by the selection. Every method is scored
 on the identical cases and pixels over the whole 1024 x 832 km domain, so
 the network sees inflow from upstream radar data rather than from crop edges.
+The baseline "flow" is extrapolation with the optical flow of advection.py.
 
 Results go to runs/eval/<population>/<method>.json: pooled scores per lead
 time (verify.py) and per-case CRPS for paired comparisons. An interrupted
-evaluation resumes from <method>.partial.pt.
+evaluation resumes from <method>.partial.pt, which is only accepted if it was
+written for the same method, checkpoint step and ensemble size.
 """
 
 import argparse
@@ -31,7 +33,7 @@ from . import baselines
 from .config import RUNS_DIR, STEPS_PER_HOUR, TEST_YEARS, VAL_YEARS
 from .data import time_context
 from .advection import departure_points, estimate_velocity, sample
-from .model import Nowcaster
+from .model import from_checkpoint
 from .radklim import depth_to_rate
 from .store import Season
 from .transforms import y_to_rate
@@ -86,11 +88,8 @@ class NetworkForecaster:
     def __init__(self, checkpoint: Path, members: int, chunk: int = 5):
         state = torch.load(checkpoint, map_location="cuda", weights_only=False)
         args = state["args"]
-        self.model = Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
-                               optical_flow=not args.get("no_optical_flow", True),
-                               noise=args.get("noise", "concat"),
-                               film_levels=tuple(args.get("film_levels", (5, 2))),
-                               correction_max=args.get("correction_max", 10.0)).cuda().eval()
+        self.model = from_checkpoint(args).cuda().eval()
+        self.provenance = {"checkpoint": str(checkpoint), "step": state.get("step"), "members": members}
         self.model.load_state_dict(state["model"])
         self.members, self.chunk, self.history = members, chunk, args["history"]
         self.generator = torch.Generator(device="cuda")
@@ -133,8 +132,14 @@ def main(argv=None):
     scores = Scores(LEADS, members)
     per_case = []
     partial = out_dir / f"{name}.partial.pt"
+    forecaster = None
+    if is_network or args.method == "flow":
+        forecaster = NetworkForecaster(Path(args.method), members) if is_network else FlowForecaster()
+    provenance = getattr(forecaster, "provenance", {"method": args.method, "members": members})
     if partial.exists():
         state = torch.load(partial, map_location="cuda", weights_only=False)
+        if state.get("provenance", provenance) != provenance:
+            raise SystemExit(f"{partial} was written for {state['provenance']}, not {provenance}: delete it to start over")
         scores.__dict__.update(state["scores"])
         per_case = state["cases"]
     done = {(c["year"], c["t0"]) for c in per_case}
@@ -149,11 +154,10 @@ def main(argv=None):
             **{f"crps_y_{s}km": ((scores.crps[s] - b[0]) / (scores.crps_n[s] - b[1])).cpu().tolist()
                for s, b in before.items()},
         })
-        torch.save({"scores": scores.__dict__, "cases": per_case}, partial)
+        torch.save({"scores": scores.__dict__, "cases": per_case, "provenance": provenance}, partial)
         print(f"{len(per_case)}/{len(cases)} {per_case[-1]['time']}  crps_1km@60min={per_case[-1]['crps_y_1km'][11]:.4f}", flush=True)
 
-    if is_network or args.method == "flow":
-        forecaster = NetworkForecaster(Path(args.method), members) if is_network else FlowForecaster()
+    if forecaster is not None:
         for year, t0 in todo:
             history, obs, context = load_case(year, t0, getattr(forecaster, "history", HISTORY))
             record(forecaster(history, context, seed=t0), obs, year, t0)
@@ -177,7 +181,7 @@ def main(argv=None):
                 del forecast
 
     per_case.sort(key=lambda c: (c["year"], c["t0"]))
-    result = {"method": args.method, "population": population, "summary": scores.summary(), "cases": per_case}
+    result = {"method": args.method, "population": population, "provenance": provenance, "summary": scores.summary(), "cases": per_case}
     (out_dir / f"{name}.json").write_text(json.dumps(result))
     partial.unlink(missing_ok=True)
     print("crps_y_1km by lead:", np.round(result["summary"]["crps_y_1km"], 4).tolist())

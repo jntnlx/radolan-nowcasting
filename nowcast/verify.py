@@ -26,6 +26,14 @@ Scores
                 in any large window, so both fields are multiplied by the same
                 observed coverage mask (cases with < 90% coverage are skipped);
                 gap artifacts then largely cancel in the forecast/observed ratio.
+    Anisotropy  energy-weighted coherence of the gradient structure tensor of y
+                in 16 km windows, for observations and members: 0 for locally
+                isotropic texture, 1 for parallel streaks. The radially averaged
+                spectrum cannot see direction; this can. Judge a forecast
+                against the observed value, which is not 0 (rain bands).
+    Accumulation  fair CRPS (in y, at 1 and 16 km) of the mean rain rate over the
+                first hour and over two hours: sensitive to the temporal
+                coherence of the members, which per-lead scores do not test.
 """
 
 import math
@@ -42,6 +50,9 @@ FSS_THRESHOLDS = (1.0, 5.0, 10.0)
 FSS_WINDOWS = (1, 5, 11, 21, 41)          # km
 SPECTRUM_WINDOW = (slice(256, 768), slice(160, 672))  # central 512 km; ~96% covered on average
 SPECTRUM_MIN_COVERAGE = 0.9
+ANISOTROPY_WINDOW = 16                    # km
+ACCUMULATIONS = (12, 24)                  # leads: 1 h and 2 h
+ACCUMULATION_SCALES = (1, 16)             # km
 
 
 def _fractions(binary: torch.Tensor, valid: torch.Tensor, n: int) -> torch.Tensor:
@@ -61,12 +72,29 @@ def radial_spectrum(field: torch.Tensor) -> torch.Tensor:
     window = taper[:, None] * taper[None]
     power = torch.fft.fft2((field - field.mean((-2, -1), keepdim=True)) * window).abs() ** 2
     k = torch.fft.fftfreq(n, device=field.device) * n
-    radius = torch.sqrt(k[:, None] ** 2 + k[None] ** 2).round().long().clamp(max=n // 2)
-    flat = power.reshape(-1, n * n)
+    radius = torch.sqrt(k[:, None] ** 2 + k[None] ** 2).round().long().reshape(-1)
+    keep = radius <= n // 2  # the corners of the spectrum (|k| beyond Nyquist of one axis) belong to no ring
+    flat = power.reshape(-1, n * n)[:, keep]
     out = torch.zeros(flat.shape[0], n // 2 + 1, device=field.device, dtype=field.dtype)
-    out.index_add_(1, radius.reshape(-1), flat)
-    counts = torch.bincount(radius.reshape(-1), minlength=n // 2 + 1).to(field.dtype)
+    out.index_add_(1, radius[keep], flat)
+    counts = torch.bincount(radius[keep], minlength=n // 2 + 1).to(field.dtype)
     return (out / counts).reshape(*field.shape[:-2], n // 2 + 1)
+
+
+def anisotropy_sums(y: torch.Tensor, valid: torch.Tensor, window: int = ANISOTROPY_WINDOW) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sums for the coherence of the gradient structure tensor of y (..., H, W).
+
+    With J the tensor of gradient products averaged over a window and
+    l1 >= l2 its eigenvalues, returns (sum of l1 - l2, sum of l1 + l2) over
+    windows, each (...). Their ratio is the energy-weighted mean coherence.
+    Gradients that touch a pixel without data are left out.
+    """
+    gx, gy = y[..., :-1, 1:] - y[..., :-1, :-1], y[..., 1:, :-1] - y[..., :-1, :-1]
+    ok = (valid[..., :-1, :-1] & valid[..., :-1, 1:] & valid[..., 1:, :-1]).to(y.dtype)
+    pool = lambda t: F.avg_pool2d(t.reshape(-1, 1, *t.shape[-2:]), window).reshape(*t.shape[:-2], -1)
+    jxx, jyy, jxy = pool(gx * gx * ok), pool(gy * gy * ok), pool(gx * gy * ok)
+    return torch.sqrt((jxx - jyy) ** 2 + 4 * jxy**2).sum(-1), (jxx + jyy).sum(-1)
 
 
 class Scores:
@@ -89,6 +117,10 @@ class Scores:
         self.rank = z(members + 1)
         self.spectrum_obs = z(257)
         self.spectrum_fcst = z(257)
+        self.anisotropy_obs = z(2)    # sums of l1 - l2 and of l1 + l2
+        self.anisotropy_fcst = z(2)
+        zeros = lambda: torch.zeros(len(ACCUMULATIONS), len(ACCUMULATION_SCALES), dtype=torch.float64, device=device)
+        self.crps_acc, self.crps_acc_n = zeros(), zeros()
         self.cases = 0
 
     @torch.no_grad()
@@ -99,6 +131,20 @@ class Scores:
         for k in range(0, self.leads, chunk):
             sl = slice(k, min(k + chunk, self.leads))
             self._add(forecast[:, sl].to(self.device, torch.float32), obs[sl].to(self.device, torch.float32), sl)
+        for i, horizon in enumerate(ACCUMULATIONS):
+            if horizon > self.leads:
+                continue
+            o = obs[:horizon].to(self.device, torch.float32)
+            valid = torch.isfinite(o).all(0)
+            o = torch.where(valid, o.mean(0), 0.0)
+            f = torch.stack([member[:horizon].to(self.device, torch.float32).clamp(min=0).mean(0) for member in forecast])
+            for j, s in enumerate(ACCUMULATION_SCALES):
+                if s > min(o.shape[-2:]):
+                    continue
+                pf, _ = pool_rate(f, valid, s)
+                po, ok = pool_rate(o, valid, s)
+                self.crps_acc[i, j] += (crps_ensemble(rate_to_y(pf), rate_to_y(po), alpha=1.0) * ok).sum().double()
+                self.crps_acc_n[i, j] += ok.sum().double()
         self.cases += 1
 
     def _add(self, forecast, obs, sl) -> None:
@@ -154,6 +200,10 @@ class Scores:
             for r in range(m + 1):
                 self.rank[r, sl] += lead((rank == r) & wet)
 
+        if min(obs.shape[-2:]) >= 2 * ANISOTROPY_WINDOW:
+            self.anisotropy_obs[:, sl] += torch.stack(anisotropy_sums(y_o, valid)).double()
+            self.anisotropy_fcst[:, sl] += torch.stack(anisotropy_sums(y_f, valid)).sum(1).double()
+
         rows, cols = SPECTRUM_WINDOW
         if obs.shape[-2] >= rows.stop and obs.shape[-1] >= cols.stop:
             mask = valid[:, rows, cols].float()
@@ -184,6 +234,12 @@ class Scores:
         if self.members > 1:
             out["spread_y"] = (self.variance / self.n * (self.members + 1) / self.members).sqrt().cpu().tolist()
             out["rank_histogram"] = (self.rank / self.rank.sum(0)).T.cpu().tolist()
+        out["anisotropy_obs"] = div(self.anisotropy_obs[0], self.anisotropy_obs[1])
+        out["anisotropy_fcst"] = div(self.anisotropy_fcst[0], self.anisotropy_fcst[1])
+        for i, horizon in enumerate(ACCUMULATIONS):
+            for j, s in enumerate(ACCUMULATION_SCALES):
+                if self.crps_acc_n[i, j] > 0:
+                    out[f"crps_acc{5 * horizon}_y_{s}km"] = float(self.crps_acc[i, j] / self.crps_acc_n[i, j])
         out["spectrum_obs"] = self.spectrum_obs.T.cpu().tolist()
         out["spectrum_fcst"] = self.spectrum_fcst.T.cpu().tolist()
         return out

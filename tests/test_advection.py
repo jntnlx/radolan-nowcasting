@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from nowcast.advection import departure_points, estimate_velocity, grid, sample
+from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample
 
 
 def blob(h=96, w=96, x0=48.0, y0=48.0, sigma=4.0):
@@ -72,3 +72,34 @@ def test_variational_flow_recovers_a_translation():
     velocity = estimate_velocity(frames, torch.ones(1, 1, 128, 128, dtype=torch.bool), grid=16, pool=4, iterations=150)
     interior = velocity[..., 2:-2, 2:-2]
     assert abs(float(interior[:, 0].mean()) - u) < 0.2 and abs(float(interior[:, 1].mean()) - v) < 0.2
+
+
+def test_deformation_of_rigid_and_straining_flows():
+    pos = grid(1, 96, 96)
+    rx, ry = pos[:, 0] - 48, pos[:, 1] - 48
+    rotation = torch.stack([-0.02 * ry, 0.02 * rx], dim=1)  # rigid: no stretching
+    strain = torch.stack([0.02 * rx, -0.02 * ry], dim=1)    # pure strain, rate e = 0.02 per step
+    centre = (slice(None), slice(30, 66), slice(30, 66))
+    anisotropy, det = deformation(departure_points(rotation, 24)[-1])
+    assert float((anisotropy[centre] - 1).abs().max()) < 0.01 and float(det[centre].min()) > 0.99
+    anisotropy, _ = deformation(departure_points(strain, 24)[-1])
+    expected = math.exp(2 * 0.02 * 24)  # material lines stretch like exp(e t) along one axis and shrink along the other
+    assert float((anisotropy[centre] / expected - 1).abs().max()) < 0.02
+
+
+def test_flow_does_not_explain_growth_and_decay_by_strain():
+    # A translating texture whose amplitude grows on one side and decays on the other: the fitted
+    # motion must stay a translation, so that the 2 h trajectory map does not shear features into streaks.
+    torch.manual_seed(0)
+    texture = torch.nn.functional.avg_pool2d(torch.rand(1, 1, 200, 200), 9, stride=1, padding=4)
+    texture = (texture - texture.mean()) / texture.std() + 1.5  # contrast comparable to the amplitude trend
+    u, v = 2.0, -1.0
+    trend = 1 + 0.08 * torch.tanh((grid(1, 128, 128)[:, :1] - 64) / 20)  # per step: +8% east, -8% west
+    frames = torch.cat([sample(texture, grid(1, 128, 128) + torch.tensor([36 + u * (5 - j), 36 + v * (5 - j)]).reshape(1, 2, 1, 1))
+                        * trend ** j for j in range(6)], dim=1)
+    velocity = estimate_velocity(frames, torch.ones(1, 1, 128, 128, dtype=torch.bool))
+    interior = velocity[..., 2:-2, 2:-2]
+    assert abs(float(interior[:, 0].mean()) - u) < 0.25 and abs(float(interior[:, 1].mean()) - v) < 0.25
+    anisotropy, det = deformation(departure_points(velocity, 24, upsample=16)[-1])
+    assert float(anisotropy.median()) < 1.3 and float(anisotropy.quantile(0.99)) < 2.0 and float(det.min()) > 0.5
+    # (with the former smoothness of 0.01: median 1.5, 99th percentile 3.5)
