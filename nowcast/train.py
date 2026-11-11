@@ -25,8 +25,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from .config import RUNS_DIR, TRAIN_YEARS, VAL_YEARS
-from .data import FixedWindows, RandomWindows, Windows, to_model_space
-from .advection import deformation
+from .data import FixedWindows, RandomWindows, Windows, single_thread, to_model_space
+from .advection import deformation, shear
 from .losses import advection_crps, motion_consistency, multiscale_crps, smoothness
 from .model import from_checkpoint
 
@@ -66,6 +66,9 @@ def parse_args(argv=None):
                    help="penalty on the tanh argument of the velocity correction (keeps it out of saturation)")
     p.add_argument("--flow-smoothness", type=float, default=0.1,
                    help="Horn-Schunck weight of the optical-flow first guess (advection.estimate_velocity)")
+    p.add_argument("--rigid-weight", type=float, default=0.0,
+                   help="penalty on the shear (s1 - s2)^2 of each member's trajectory map at the last lead: keeps the "
+                        "learned motion from deforming advected texture into streaks (advection.shear)")
     p.add_argument("--well-weight", type=float, default=0.0,
                    help="penalty on psi = y0 + S below -well_margin: bounds how deeply dry pixels are suppressed")
     p.add_argument("--well-margin", type=float, default=1.0)
@@ -90,7 +93,8 @@ def lr_factor(step: int, progress: float, warmup: int = 1000) -> float:
 
 
 def objective(model, batch, args, members=None, alpha=None, generator=None):
-    out = model(batch["inputs"], batch["input_valid"], batch["context"], members=members or args.members, generator=generator)
+    out = model(batch["inputs"], batch["input_valid"], batch["context"], members=members or args.members, generator=generator,
+                prior=batch.get("prior"))
     scores = multiscale_crps(out["forecast"], batch["targets"], batch["target_valid"],
                              scales=tuple(args.scales), alpha=args.alpha if alpha is None else alpha)
     m = out["forecast"].shape[1]
@@ -120,9 +124,14 @@ def objective(model, batch, args, members=None, alpha=None, generator=None):
     scores["wells"] = torch.relu(-psi - args.well_margin).mean()
     if args.well_weight > 0:
         scores["loss"] = scores["loss"] + args.well_weight * scores["wells"]
+    last = out["points"][args.leads - 1].float()
+    with torch.set_grad_enabled(args.rigid_weight > 0 and torch.is_grad_enabled()):
+        scores["rigid"] = shear(last).mean()
+    if args.rigid_weight > 0:
+        scores["loss"] = scores["loss"] + args.rigid_weight * scores["rigid"]
     scores["speed_kmh"] = 12 * out["velocity"].norm(dim=2).mean()
     with torch.no_grad():  # diagnostic: median stretch anisotropy of the trajectory map at the last lead (1 = rigid)
-        scores["stretch"] = deformation(out["points"][args.leads - 1].float())[0].flatten()[::7].median()
+        scores["stretch"] = deformation(last)[0].flatten()[::7].median()
     return scores
 
 
@@ -175,16 +184,21 @@ def main(argv=None):
         (run_dir / "args.json").write_text(json.dumps(vars(args), indent=2))
     step = state["step"] if state else 0
 
-    train_windows = Windows(args.train_years, args.history, args.leads, tuple(args.crop))
-    val_windows = Windows(args.val_years, args.history, args.leads, tuple(args.crop))
-    # A resumed run draws a fresh sample stream instead of replaying the first one.
-    loader = DataLoader(RandomWindows(train_windows, args.seed + step), batch_size=args.batch,
-                        num_workers=args.workers, pin_memory=True, prefetch_factor=4, persistent_workers=True)
-    val_loader = DataLoader(FixedWindows(val_windows, args.val_samples, seed=12345), batch_size=args.batch,
-                            num_workers=args.workers)
-
     torch.cuda.set_per_process_memory_fraction(args.gpu_memory_fraction)
     model = from_checkpoint(vars(args)).to(device)
+    # The loader workers compute the optical-flow first guess (data.py); the model receives it as `prior`.
+    flow = dict(model.flow, grid=2 ** model.velocity_level) if model.optical_flow else None
+    train_windows = Windows(args.train_years, args.history, args.leads, tuple(args.crop), flow=flow)
+    val_windows = Windows(args.val_years, args.history, args.leads, tuple(args.crop), flow=flow)
+    # A resumed run draws a fresh sample stream instead of replaying the first one.
+    loader = DataLoader(RandomWindows(train_windows, args.seed + step), batch_size=args.batch, num_workers=args.workers,
+                        pin_memory=True, prefetch_factor=4, persistent_workers=True, worker_init_fn=single_thread)
+    val_loader = DataLoader(FixedWindows(val_windows, args.val_samples, seed=12345), batch_size=args.batch,
+                            num_workers=min(args.workers, 3), persistent_workers=True, worker_init_fn=single_thread)
+    # Both sets of workers are forked now, before the first backward pass: the flow fit in the workers uses
+    # autograd, which cannot be started in a process forked from one whose autograd engine is already running.
+    batches, _ = iter(loader), iter(val_loader)
+
     ema = copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.99), weight_decay=0.01)
     best, elapsed_before = math.inf, 0.0
@@ -199,7 +213,7 @@ def main(argv=None):
     step_fn = torch.compile(model) if args.compile else model
 
     budget = args.hours * 3600
-    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh", "saturation", "wells", "stretch", "gpu_gb"]
+    columns = ["step", "hours", "lr", "grad_norm", "loss", "crps", "crps_1km", "crps_4km", "crps_16km", "crps_64km", "motion", "smoothness", "speed_kmh", "saturation", "wells", "rigid", "stretch", "gpu_gb"]
     log = open(run_dir / "log.tsv", "a" if state else "w")
     if not state:
         log.write("\t".join(columns) + "\n")
@@ -218,7 +232,7 @@ def main(argv=None):
                 os._exit(3)
 
     threading.Thread(target=watchdog, daemon=True).start()
-    for raw in loader:
+    for raw in batches:
         elapsed = time.time() - started
         progress = max(elapsed / budget, step / args.steps if args.steps else 0.0)
         if progress >= 1:

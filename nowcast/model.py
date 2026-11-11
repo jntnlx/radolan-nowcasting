@@ -21,9 +21,9 @@ and local evolution.
 Motion: a U-Net cannot learn to infer displacements of tens of kilometres
 from stacked frames (a network trained so learned no usable motion at all).
 The velocity is therefore u = u_0 + du: u_0 is a variational optical flow
-fitted to the observed past inside the forward pass (advection.py,
-`estimate_velocity`; on the full domain as skilful as pysteps' Lucas-Kanade
-extrapolation, in under a second on the GPU instead of ~13 s on the CPU), and the
+fitted to the observed past (advection.py, `estimate_velocity`; on the full
+domain as skilful as pysteps' Lucas-Kanade extrapolation; computed by the
+data-loader workers during training and by `first_guess` at inference), and the
 network predicts a bounded correction du, trained on the future, together
 with the members' motion perturbations.
 

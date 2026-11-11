@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample
+from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample, shear
 
 
 def blob(h=96, w=96, x0=48.0, y0=48.0, sigma=4.0):
@@ -85,6 +85,12 @@ def test_deformation_of_rigid_and_straining_flows():
     anisotropy, _ = deformation(departure_points(strain, 24)[-1])
     expected = math.exp(2 * 0.02 * 24)  # material lines stretch like exp(e t) along one axis and shrink along the other
     assert float((anisotropy[centre] / expected - 1).abs().max()) < 0.02
+    # shear = (s1 - s2)^2: zero for the rotation and for a uniform dilation, exp(e t) - exp(-e t) squared for the strain
+    assert float(shear(departure_points(rotation, 24)[-1])[centre].max()) < 1e-4
+    dilation = torch.stack([0.01 * rx, 0.01 * ry], dim=1)
+    assert float(shear(departure_points(dilation, 24)[-1])[centre].max()) < 1e-4
+    s = shear(departure_points(strain, 24)[-1])[centre]
+    assert float((s / (math.exp(0.48) - math.exp(-0.48)) ** 2 - 1).abs().max()) < 0.05
 
 
 def test_flow_does_not_explain_growth_and_decay_by_strain():

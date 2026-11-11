@@ -21,6 +21,11 @@ keeps dry scenes, where initiation happens, in the training distribution.
 
 Workers return raw depth integers; conversion to model space happens on the
 GPU (`to_model_space`), which halves the host-to-device traffic.
+
+The optical-flow first guess of the motion is a fixed function of the inputs
+(no gradient passes through it), so the workers compute it as well: its many
+small iterations cost 0.3 s per sample on one CPU core, but took 60% of a
+training step when run on the GPU inside the forward pass.
 """
 
 import math
@@ -29,6 +34,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
+from .advection import estimate_velocity
 from .config import DOMAIN_SHAPE
 from .radklim import DEPTH_QUANTUM_MM, NODATA
 from .store import TILE, TILES, Season
@@ -41,15 +47,34 @@ def time_context(t) -> np.ndarray:
     return np.array([math.sin(day), math.cos(day), math.sin(year), math.cos(year)], dtype=np.float32)
 
 
+def first_guess(depth: np.ndarray, flow: dict) -> torch.Tensor:
+    """Optical-flow first guess (2, H / grid, W / grid) from the stored depth integers of the input frames (T, H, W)."""
+    valid = torch.from_numpy(depth != NODATA)
+    rate = torch.from_numpy(depth.astype(np.float32)) * (DEPTH_QUANTUM_MM * 12)
+    y = torch.log1p(torch.where(valid, rate, 0.0))  # as in to_model_space
+    return estimate_velocity(y[None], valid.all(0)[None, None], **flow)[0]
+
+
+def single_thread(_worker_id: int) -> None:
+    """DataLoader worker_init_fn: one core per worker (the flow fit is many tiny operations)."""
+    torch.set_num_threads(1)
+
+
 class Windows:
-    """Sampling distribution over (season, t0, crop) for a set of years."""
+    """
+    Sampling distribution over (season, t0, crop) for a set of years.
+
+    flow: options of advection.estimate_velocity; if given, each sample carries the
+    optical-flow first guess of its motion ("prior").
+    """
 
     def __init__(self, years, history: int, leads: int, crop: tuple[int, int] = DOMAIN_SHAPE,
-                 floor: float = 0.05, min_valid: float = 0.3):
+                 floor: float = 0.05, min_valid: float = 0.3, flow: dict | None = None):
         if crop[0] % TILE or crop[1] % TILE:
             raise ValueError(f"crop {crop} must be a multiple of the {TILE} km tile")
         self.seasons = [Season(y) for y in years]
         self.history, self.leads, self.crop, self.floor = history, leads, crop, floor
+        self.flow = flow
         self.crop_tiles = (crop[0] // TILE, crop[1] // TILE)
         self.offsets = [(r, c) for r in range(TILES[0] - self.crop_tiles[0] + 1)
                         for c in range(TILES[1] - self.crop_tiles[1] + 1)]
@@ -83,11 +108,14 @@ class Windows:
         rows = slice(r * TILE, r * TILE + self.crop[0])
         cols = slice(c * TILE, c * TILE + self.crop[1])
         depth = season.frames(t0 - self.history + 1, t0 + self.leads + 1, rows, cols)
-        return {
+        sample = {
             "depth": torch.from_numpy(np.ascontiguousarray(depth).view(np.int16)),  # bit-identical; NODATA reads as -1
             "context": torch.from_numpy(time_context(season.time(t0))),
             "key": torch.tensor([season.year, t0, r * TILE, c * TILE]),
         }
+        if self.flow is not None:
+            sample["prior"] = first_guess(depth[:self.history], self.flow)
+        return sample
 
 
 class RandomWindows(IterableDataset):
@@ -124,10 +152,13 @@ def to_model_space(batch: dict, history: int, device) -> dict:
     valid = depth != int(NODATA)
     rate = torch.where(valid, depth.float() * (DEPTH_QUANTUM_MM * 12), 0.0)
     y = torch.log1p(rate)
-    return {
+    out = {
         "inputs": y[:, :history],
         "input_valid": valid[:, :history].all(dim=1, keepdim=True),
         "targets": y[:, history:],
         "target_valid": valid[:, history:],
         "context": batch["context"].to(device, non_blocking=True),
     }
+    if "prior" in batch:
+        out["prior"] = batch["prior"].to(device, non_blocking=True)
+    return out

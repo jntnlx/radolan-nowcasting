@@ -104,6 +104,22 @@ def deformation(points: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return ((q + disc) / 2).sqrt() / ((q - disc) / 2).clamp(min=1e-12).sqrt(), det
 
 
+def shear(points: torch.Tensor) -> torch.Tensor:
+    """
+    Squared difference of the singular values of the Jacobian of a trajectory map, (s1 - s2)^2, (B, H - 1, W - 1).
+
+    For J = [[a, b], [c, d]] this is |J|^2 - 2 det J = (a - d)^2 + (b + c)^2: it vanishes exactly
+    for rotations with uniform scaling (the Cauchy-Riemann conditions), i.e. for maps that
+    keep isotropic texture isotropic. Unlike the anisotropy ratio of `deformation` it is a
+    polynomial in the map, with finite gradients everywhere, so it can serve as a penalty.
+    """
+    a = points[:, 0, :-1, 1:] - points[:, 0, :-1, :-1]
+    b = points[:, 0, 1:, :-1] - points[:, 0, :-1, :-1]
+    c = points[:, 1, :-1, 1:] - points[:, 1, :-1, :-1]
+    d = points[:, 1, 1:, :-1] - points[:, 1, :-1, :-1]
+    return (a - d) ** 2 + (b + c) ** 2
+
+
 @torch.compiler.disable  # an inner optimization loop: runs eagerly inside compiled models
 def estimate_velocity(
     history: torch.Tensor,
@@ -164,22 +180,24 @@ def estimate_velocity(
             return sum(((sample(x[:, t - 1 - j:t - j], points[j - 1])[:, 0] - x[:, -1]).abs() * mask).sum((1, 2)) / n
                        for j in range(1, t)) / (t - 1)
 
-        def minimize(parameter, loss_fn, steps):
-            optimizer = torch.optim.Adam([parameter], lr=lr)
+        def minimize(parameter, loss_fn, steps, beta1=0.9, beta2=0.999, eps=1e-8):
+            # Adam, written out: torch.optim touches CUDA state on every step, which fails in the
+            # forked data-loader workers that compute the first guess during training (data.py).
+            m, v = torch.zeros_like(parameter), torch.zeros_like(parameter)
             for i in range(steps):
-                optimizer.param_groups[0]["lr"] = lr_end + (lr - lr_end) * 0.5 * (1 + math.cos(math.pi * i / steps))
-                loss = loss_fn(parameter).sum()  # samples are independent
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                step = lr_end + (lr - lr_end) * 0.5 * (1 + math.cos(math.pi * i / steps))
+                gradient, = torch.autograd.grad(loss_fn(parameter).sum(), parameter)  # samples are independent
+                m, v = beta1 * m + (1 - beta1) * gradient, beta2 * v + (1 - beta2) * gradient**2
+                update = (m / (1 - beta1 ** (i + 1))) / ((v / (1 - beta2 ** (i + 1))).sqrt() + eps)
+                parameter = (parameter - step * update).detach().requires_grad_(True)
+            return parameter.detach()
 
-        mean = torch.zeros(b, 2, 1, 1, device=x.device, requires_grad=True)
-        minimize(mean, lambda m: mismatch(m.expand(shape)), uniform_iterations)
-        velocity = mean.detach().expand(shape).clone().requires_grad_(True)
+        mean = minimize(torch.zeros(b, 2, 1, 1, device=x.device, requires_grad=True), lambda m: mismatch(m.expand(shape)),
+                        uniform_iterations)
+        velocity = mean.expand(shape).clone().requires_grad_(True)
 
         def objective(v):
             rough = (v[..., 1:] - v[..., :-1]).pow(2).mean((1, 2, 3)) + (v[..., 1:, :] - v[..., :-1, :]).pow(2).mean((1, 2, 3))
             return mismatch(v) + smoothness * rough
 
-        minimize(velocity, objective, iterations)
-    return velocity.detach()
+        return minimize(velocity, objective, iterations)
