@@ -153,14 +153,20 @@ def estimate_velocity(
 
     The smoothness weight decides what the field is good for. Growth and
     decay are not motion, but a weakly regularized fit explains them as
-    convergence and divergence. With 0.01 the strain of the fitted field
-    deformed the 2 h trajectory map severely (in rain: median stretch
-    anisotropy 2.4-2.8, 90th percentile 8-10, 1-2% of pixels folded), which
-    drew every advected feature as a streak. With 0.1 the map stays nearly
-    rigid (1.45, 2.3, 0.02%) at the same skill of pure advection (mean
-    absolute error at +15 to +120 min within 0.5%, on 30 full-domain cases of
-    the training seasons 2019-20; 0.03 to 0.15 are equivalent in skill and
-    differ only in deformation). See `deformation`.
+    convergence and divergence. That helps pure extrapolation (shrinking
+    areas keep shrinking), and it deforms the 2 h trajectory map, which
+    draws every advected feature as a streak (see `deformation`). Measured
+    in rain at +2 h (median stretch anisotropy of the map; mean absolute
+    error of pure advection relative to the value at 0.1):
+
+        0.01 (first models)   2.4 - 2.8, 1-2% of pixels folded    +-0%
+        0.1  (default here)   1.45                                reference
+        1.0  (training)       1.10                                +5 to +9%
+
+    For extrapolation alone 0.1 is the best compromise. Inside the model
+    the source term represents growth and decay, and a nearly rigid first
+    guess (1.0, with a shear penalty on the learned correction) removed the
+    streaks at a cost of about 1% in pixel-scale CRPS up to +60 min.
 
     Legacy behaviour (checkpoints trained before this change): smoothness 0.01,
     uniform_iterations 0, lr_end = lr.

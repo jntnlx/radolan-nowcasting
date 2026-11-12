@@ -7,7 +7,8 @@ Train the stochastic Lagrangian nowcaster.
 
 Objective per sample: multiscale almost-fair CRPS of the forecast ensemble,
 plus a small motion-consistency term that ties the velocity field to the
-observed past (losses.py). Validation tracks the fair CRPS (alpha = 1) of an
+observed past (losses.py) and a penalty on the shear of each member's
+trajectory map (advection.shear). Validation tracks the fair CRPS (alpha = 1) of an
 exponential moving average of the weights on a fixed sample of validation
 windows, next to the CRPS of persistence on the same windows.
 """
@@ -64,9 +65,10 @@ def parse_args(argv=None):
     p.add_argument("--correction-max", type=float, default=4.0, help="bound of the learned velocity correction, px per step")
     p.add_argument("--correction-weight", type=float, default=1e-3,
                    help="penalty on the tanh argument of the velocity correction (keeps it out of saturation)")
-    p.add_argument("--flow-smoothness", type=float, default=0.1,
-                   help="Horn-Schunck weight of the optical-flow first guess (advection.estimate_velocity)")
-    p.add_argument("--rigid-weight", type=float, default=0.0,
+    p.add_argument("--flow-smoothness", type=float, default=1.0,
+                   help="Horn-Schunck weight of the optical-flow first guess (advection.estimate_velocity). 1.0 gives a "
+                        "nearly rigid 2 h trajectory map; 0.1 is best for pure extrapolation but its strain streaks the members")
+    p.add_argument("--rigid-weight", type=float, default=0.1,
                    help="penalty on the shear (s1 - s2)^2 of each member's trajectory map at the last lead: keeps the "
                         "learned motion from deforming advected texture into streaks (advection.shear)")
     p.add_argument("--well-weight", type=float, default=0.0,
@@ -164,7 +166,7 @@ def main(argv=None):
     state = None
     if args.resume:
         defaults = vars(parse_args(["--run", args.run]))  # options added since the run started ...
-        legacy = {"correction_max": 10.0, "correction_weight": 0.0, "flow_smoothness": None}  # ... with their behaviour before they existed
+        legacy = {"correction_max": 10.0, "correction_weight": 0.0, "flow_smoothness": None, "rigid_weight": 0.0}  # ... with their behaviour before they existed
         saved = json.loads((run_dir / "args.json").read_text())
         if args.hours is not None:
             saved["hours"] = args.hours
