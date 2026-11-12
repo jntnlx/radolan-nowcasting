@@ -77,6 +77,14 @@ def parse_args(argv=None):
     p.add_argument("--motion-cells", type=int, default=32, help="correlation length of that perturbation, in 16 km cells")
     p.add_argument("--source-level", type=int, default=0,
                    help="predict the source on the 2^level km grid: a smooth growth/decay field (0: full resolution)")
+    p.add_argument("--texture", type=float, default=0.0,
+                   help="> 0: positive source on dry pixels is redistributed per member by a random cascade weight of mean one "
+                        "(texture noise finer than this wavelength in km, 64 recommended): new rain as cells, not haze")
+    p.add_argument("--clamp-psi", action="store_true",
+                   help="clamp psi = y0 + S to [0, Y_MAX] before resampling it at the departure points")
+    p.add_argument("--padding", choices=("border", "reflection"), default="border",
+                   help="inflow across the domain edge: repeated edge values or the mirrored field")
+    p.add_argument("--interpolation", choices=("bilinear", "bicubic"), default="bilinear")
     p.add_argument("--well-weight", type=float, default=0.0,
                    help="penalty on psi = y0 + S below -well_margin: bounds how deeply dry pixels are suppressed")
     p.add_argument("--well-margin", type=float, default=1.0)

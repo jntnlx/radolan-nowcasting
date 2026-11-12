@@ -4,7 +4,8 @@ import math
 
 import torch
 
-from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample, shear
+from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample, shear, texture_noise
+from nowcast.verify import radial_spectrum
 
 
 def blob(h=96, w=96, x0=48.0, y0=48.0, sigma=4.0):
@@ -109,3 +110,17 @@ def test_flow_does_not_explain_growth_and_decay_by_strain():
     anisotropy, det = deformation(departure_points(velocity, 24, upsample=16)[-1])
     assert float(anisotropy.median()) < 1.3 and float(anisotropy.quantile(0.99)) < 2.0 and float(det.min()) > 0.5
     # (with the former smoothness of 0.01: median 1.5, 99th percentile 3.5)
+
+
+def test_texture_noise_has_unit_variance_and_the_radar_slope_below_the_cutoff():
+    eta = texture_noise(8, 256, 256, cutoff=32.0, beta=3.5, generator=torch.Generator().manual_seed(0))
+    assert eta.shape == (8, 1, 256, 256)
+    assert torch.allclose(eta.std((-2, -1)), torch.ones(8, 1), atol=1e-3)
+    power = radial_spectrum(eta[:, 0]).mean(0)
+    k = torch.arange(len(power), dtype=torch.float64)
+    fine = (k >= 256 / 16) & (k <= 256 / 4)  # wavelengths 4-16 km, well below the cutoff
+    slope = torch.linalg.lstsq(torch.stack([k[fine].log(), torch.ones(int(fine.sum()), dtype=torch.float64)], 1),
+                               power[fine].double().log()[:, None]).solution[0, 0]
+    assert -3.9 < float(slope) < -3.1
+    # high-pass: wavelengths of 128 km and more carry far less power than an unfiltered power law would
+    assert float(power[1:3].mean()) < float(power[256 // 32]) * (256 / 32 / 2) ** 3.5 * 0.1

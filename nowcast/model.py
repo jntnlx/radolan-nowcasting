@@ -62,7 +62,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .advection import departure_points, estimate_velocity, sample, smooth_noise
+from .advection import departure_points, estimate_velocity, sample, smooth_noise, texture_noise
 
 
 def _groups(channels: int) -> int:
@@ -115,6 +115,9 @@ class Level(nn.Module):
 
 Y_MAX = math.log1p(500.0)  # 500 mm/h: above any rain rate observed in RADKLIM
 V_MAX = 10.0                # px per step = 120 km/h: above any precipitation system motion
+DRY_Y = math.log1p(0.1)     # below 0.1 mm/h a pixel counts as dry (new rain there is redistributed as cells)
+TEXTURE_Q = 1.0             # threshold of the cascade weight in standard deviations of eta: P(eta > q) = 16% of the area
+TEXTURE_MEAN = math.exp(-TEXTURE_Q**2 / 2) / math.sqrt(2 * math.pi) - TEXTURE_Q * 0.5 * math.erfc(TEXTURE_Q / math.sqrt(2))  # E[relu(eta - q)]
 
 
 LEGACY_FLOW = dict(smoothness=0.01, uniform_iterations=0, lr_end=0.3)  # flow layer of runs before lag_v5
@@ -131,6 +134,8 @@ def from_checkpoint(args: dict) -> "Nowcaster":
     return Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
                      motion_noise=args.get("motion_noise", 0.0), motion_cells=args.get("motion_cells", 32),
                      source_level=args.get("source_level", 0),
+                     texture=args.get("texture", 0.0), clamp_psi=args.get("clamp_psi", False),       # session 9
+                     padding=args.get("padding", "border"), interpolation=args.get("interpolation", "bilinear"),
                      optical_flow=not args.get("no_optical_flow", True),  # lag_v1: network-only motion
                      noise=args.get("noise", "concat"),                    # lag_v1, lag_v2
                      film_levels=tuple(args.get("film_levels", (5, 2))),
@@ -140,6 +145,32 @@ def from_checkpoint(args: dict) -> "Nowcaster":
 def clamp_straight_through(x: torch.Tensor, low: float, high: float) -> torch.Tensor:
     """Physical bounds in the forward pass (exact zeros where dry), identity gradient in the backward pass."""
     return x + (x.clamp(low, high) - x).detach()
+
+
+class _ClampOneSided(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, low, high):
+        ctx.save_for_backward(x)
+        ctx.low, ctx.high = low, high
+        return x.clamp(low, high)
+
+    @staticmethod
+    def backward(ctx, grad):
+        x, = ctx.saved_tensors
+        # below the bound only gradients that raise x pass (descent moves along -grad), above only those that lower it
+        blocked = ((x < ctx.low) & (grad > 0)) | ((x > ctx.high) & (grad < 0))
+        return grad.masked_fill(blocked, 0), None, None
+
+
+def clamp_one_sided(x: torch.Tensor, low: float, high: float) -> torch.Tensor:
+    """
+    Physical bounds in the forward pass; in the backward pass, out of bounds, only the gradient pointing back
+    into the bounds. The plain straight-through clamp lets the spread term of the fair CRPS (-E|X - X'| / 2)
+    push a dry member ever further below zero without any effect on the forecast: unbounded dry wells
+    (psi down to -67 at +2 h after 2000 steps), which no member perturbation can bring back. Here a dry
+    pixel can still be revived by the loss, but not dug deeper.
+    """
+    return _ClampOneSided.apply(x, low, high)
 
 
 class Nowcaster(nn.Module):
@@ -173,6 +204,10 @@ class Nowcaster(nn.Module):
         motion_noise: float = 0.0,    # initial std of the members' velocity perturbation, px per step (0: none)
         motion_cells: int = 32,       # its correlation length in cells of the velocity grid (32 x 16 km = 512 km)
         source_level: int = 0,        # source predicted on the 2^level km grid (0: full resolution)
+        texture: float = 0.0,         # > 0: new rain on dry pixels as intermittent cells (cascade weight, scales < this, km)
+        clamp_psi: bool = False,      # clamp psi to [0, Y_MAX] before resampling, one-sided gradients (False: as before session 9)
+        padding: str = "border",      # inflow across the domain edge: "border" (repeat edge row) or "reflection"
+        interpolation: str = "bilinear",  # resampling of psi at the departure points: "bilinear" or "bicubic"
     ):
         super().__init__()
         self.history, self.leads = history, leads
@@ -210,6 +245,7 @@ class Nowcaster(nn.Module):
         if source_level > velocity_level:
             raise ValueError("the source cannot be coarser than the velocity grid")
         self.velocity_head = nn.Conv2d(widths[self.velocity_level], 2, 3, padding=1)
+        self.texture, self.clamp_psi, self.padding, self.interpolation = texture, clamp_psi, padding, interpolation
         self.source_head = nn.Conv2d(widths[source_level], leads, 3, padding=1)
         # log amplitude of the velocity perturbation relative to motion_noise, from the (deterministic) encoder
         self.spread_head = nn.Conv2d(widths[top], 1, 1) if motion_noise > 0 else None
@@ -292,6 +328,20 @@ class Nowcaster(nn.Module):
         velocity, source = velocity.float(), source.float()
         if self.source_level:
             source = F.interpolate(source, size=(h, w), mode="bilinear", align_corners=False)
+        latest = inputs[:, -1:].float().repeat_interleave(members, dim=0)
+        if self.texture > 0:
+            # New rain on dry pixels. The network predicts a smooth intensity h there (the pooled CRPS terms
+            # reward its areal mean); left smooth, h is the same light haze in every member, a poor forecast
+            # at the pixel scale and nothing like radar rain. Rain is a multiplicative cascade: each member
+            # redistributes the rain rate of h with a random weight of mean one, W = relu(eta - q) / E[relu(eta - q)],
+            # eta a texture field (advection.texture_noise). Areal mean rates are kept (a 0.5 mm/h haze becomes
+            # cells of ~3 mm/h, peaks ~12 mm/h, on ~16% of the area), different in every member. One field per
+            # member for all leads, in analysis-time coordinates: cells persist and move with the member.
+            eta = texture_noise(b * members, h, w, self.texture, generator=generator, device=source.device)
+            weight = F.relu(eta - TEXTURE_Q) / TEXTURE_MEAN
+            new = (latest < DRY_Y) & (source > 0)
+            cells = torch.log1p(torch.expm1(source.clamp(min=0, max=Y_MAX)) * weight)
+            source = torch.where(new, cells, source)
         factor = 2**self.velocity_level
 
         common = velocity  # the part of the motion that all members are meant to share: first guess + correction
@@ -301,14 +351,18 @@ class Nowcaster(nn.Module):
             amplitude = self.motion_noise * torch.exp(F.interpolate(log_amplitude, size=velocity.shape[-2:], mode="bilinear", align_corners=False))
             velocity = common + amplitude * xi
 
-        latest = inputs[:, -1:].float().repeat_interleave(members, dim=0)
         psi = latest + source  # Lagrangian forecast in analysis-time coordinates
+        if self.clamp_psi:
+            # psi is a rain field: bounded before it is resampled, so that the gradient with respect to the
+            # departure points sees the physical field and not the depth of dry wells below zero (whose
+            # cliffs, sampled at random positions by the member displacements, made training diverge)
+            psi = clamp_one_sided(psi, 0.0, Y_MAX)
         points = departure_points(velocity, max(self.leads, self.history - 1), upsample=factor)
         # One interpolation per lead, batched over leads: (B*M*K, 1, H, W) sampled at X_k.
         bm = b * members
         stacked = torch.stack(points[:self.leads], dim=1).reshape(bm * self.leads, 2, h, w)
-        forecast = sample(psi.reshape(bm * self.leads, 1, h, w), stacked).reshape(bm, self.leads, h, w)
-        forecast = clamp_straight_through(forecast, 0.0, Y_MAX)
+        forecast = sample(psi.reshape(bm * self.leads, 1, h, w), stacked, self.padding, self.interpolation).reshape(bm, self.leads, h, w)
+        forecast = (clamp_one_sided if self.clamp_psi else clamp_straight_through)(forecast, 0.0, Y_MAX)
 
         unstack = lambda t: t.reshape(b, members, *t.shape[1:])
         return {

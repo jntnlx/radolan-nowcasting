@@ -7,7 +7,8 @@ Visual gate: do individual members look like radar fields?
 For five fixed validation cases (the July 2021 flood case, the case on which the network is
 worst and the one on which it is best relative to STEPS, a convective case and a median one)
 and +30 / +60 / +120 min, one figure per case shows the observation, three members of the
-network, one member of the displacement ensemble of the analysis (evaluate.py) and, if cached
+network, one member of the displacement ensemble of the analysis with the training flow (the
+untrained network; evaluate.py) and, if cached
 in runs/panel_cache/, two STEPS members. Scores cannot replace this look: an ensemble can have
 good marginal scores with members that no forecaster would accept as rain fields.
 """
@@ -47,7 +48,7 @@ def main():
     out = args.out or args.checkpoint.parent
     out.mkdir(parents=True, exist_ok=True)
     name = args.checkpoint.parent.name
-    network, displaced = NetworkForecaster(args.checkpoint, 5), DisplacementForecaster(5)
+    network, displaced = NetworkForecaster(args.checkpoint, 5), DisplacementForecaster(5, smoothness=1.0)
 
     for case in CASES:
         year, t0 = time_index(datetime.fromisoformat(case + ":00"))
@@ -59,7 +60,7 @@ def main():
         cut = np.s_[..., r:r + WINDOW, c:c + WINDOW]
         members = network(history, context, seed=t0)[:3, lead].cpu().numpy()[cut]
         columns = [("observed", obs[lead][cut])] + [(f"{name}, member {i + 1}", m) for i, m in enumerate(members)]
-        columns.append(("displaced analysis, member 1", displaced(history[-6:], context, seed=t0)[0, lead].cpu().numpy()[cut]))
+        columns.append(("untrained (displaced analysis), member 1", displaced(history[-6:], context, seed=t0)[0, lead].cpu().numpy()[cut]))
         cache = RUNS_DIR / "panel_cache" / f"steps_{case}.npy"
         if cache.exists():
             columns += [(f"STEPS, member {i + 1}", m[cut]) for i, m in enumerate(np.load(cache).astype(np.float32))]

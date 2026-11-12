@@ -35,14 +35,22 @@ def grid(batch: int, height: int, width: int, device=None, dtype=torch.float32) 
     return torch.stack([x, y]).expand(batch, 2, height, width)
 
 
-def sample(field: torch.Tensor, position: torch.Tensor, padding: str = "border") -> torch.Tensor:
-    """Bilinearly interpolate field (B, C, H, W) at pixel positions (B, 2, H', W')."""
+def sample(field: torch.Tensor, position: torch.Tensor, padding: str = "border", mode: str = "bilinear") -> torch.Tensor:
+    """
+    Interpolate field (B, C, H, W) at pixel positions (B, 2, H', W').
+
+    `padding` decides what flows in from outside the field: "border" repeats the edge value along
+    each trajectory (a one-dimensional edge row drawn out into stripes), "reflection" mirrors the
+    field (two-dimensional texture of the same statistics). `mode` "bicubic" keeps more of the
+    small-scale variance than "bilinear" (which acts as a low-pass filter at non-integer shifts)
+    and can overshoot, so callers clamp the result.
+    """
     height, width = field.shape[-2:]
     normalized = torch.stack([
         2 * position[:, 0] / (width - 1) - 1,
         2 * position[:, 1] / (height - 1) - 1,
     ], dim=-1)
-    return F.grid_sample(field, normalized.to(field.dtype), mode="bilinear", padding_mode=padding, align_corners=True)
+    return F.grid_sample(field, normalized.to(field.dtype), mode=mode, padding_mode=padding, align_corners=True)
 
 
 def departure_points(velocity: torch.Tensor, steps: int, upsample: int = 1) -> list[torch.Tensor]:
@@ -81,6 +89,28 @@ def smooth_noise(batch: int, channels: int, height: int, width: int, cell: int, 
     coarse = torch.randn(batch, channels, height // cell + 3, width // cell + 3, device=device, generator=generator)
     fine = F.interpolate(coarse, scale_factor=cell, mode="bicubic", align_corners=False)
     return fine[..., cell:cell + height, cell:cell + width]
+
+
+def texture_noise(batch: int, height: int, width: int, cutoff: float = 64.0, beta: float = 3.5,
+                  generator=None, device=None) -> torch.Tensor:
+    """
+    Gaussian random fields (batch, 1, height, width) of unit variance, power ~ |k|^-beta, high-passed at
+    wavelength `cutoff` grid points (scales the network's smooth source and its 32 km noise already cover).
+    Thresholded at zero, such a field is intermittent with fractal edges, which is how STEPS generates
+    rain/no-rain structure (Seed 2003); smooth interpolated fields have neither property.
+
+    The observed log-rain spectrum falls as k^-2.8 between 2 and 32 km, but a Gaussian field with that slope,
+    thresholded in its tail, is pixel-scale speckle: the edges of the thresholded field add small-scale power
+    of their own. beta = 3.5 with a 64 km cutoff gives cells of 5-30 km with fractal edges (chosen by eye on
+    thresholded fields; the spectrum of the members is measured in evaluation).
+    """
+    ky = torch.fft.fftfreq(height, device=device)[:, None]
+    kx = torch.fft.rfftfreq(width, device=device)[None, :]
+    k = torch.sqrt(kx**2 + ky**2).clamp(min=1.0 / max(height, width))
+    amplitude = k ** (-beta / 2) / (1 + (1 / (k * cutoff)) ** 4).sqrt()  # power filter 1 / (1 + (k0/k)^4)
+    white = torch.randn(batch, 1, height, width, device=device, generator=generator)
+    field = torch.fft.irfft2(torch.fft.rfft2(white) * amplitude, s=(height, width))
+    return (field - field.mean((-2, -1), keepdim=True)) / field.std((-2, -1), keepdim=True).clamp(min=1e-6)
 
 
 def inside(position: torch.Tensor, height: int, width: int) -> torch.Tensor:

@@ -1,3 +1,4 @@
+import math
 """Network contracts: shapes, persistence at initialization, stochastic members."""
 
 import torch
@@ -58,3 +59,29 @@ def test_untrained_network_with_motion_noise_is_a_displacement_ensemble():
     # while the physics terms of the objective see the common motion only (here: none).
     assert float(out["points_rigid"].sub(out["points_rigid"][:1]).abs().max()) < 1e-6
     assert torch.allclose(out["points_past"][0], out["points_past"][0][:1].expand_as(out["points_past"][0]))
+
+
+def test_one_sided_clamp_revives_but_does_not_dig():
+    from nowcast.model import clamp_one_sided
+    x = torch.tensor([-2.0, -2.0, 0.5, 9.0, 9.0], requires_grad=True)
+    y = clamp_one_sided(x, 0.0, 6.0)
+    assert torch.equal(y.detach(), torch.tensor([0.0, 0.0, 0.5, 6.0, 6.0]))
+    y.backward(torch.tensor([1.0, -1.0, 1.0, 1.0, -1.0]))
+    # below: a positive gradient (descent would lower x further) is blocked, a negative one (raise x) passes
+    assert torch.equal(x.grad, torch.tensor([0.0, -1.0, 1.0, 1.0, 0.0]))
+
+
+def test_texture_keeps_the_areal_mean_rate_of_new_rain_and_makes_it_intermittent():
+    from nowcast.model import Y_MAX
+    torch.manual_seed(0)
+    m = Nowcaster(history=6, leads=2, film_levels=(5,), source_level=2, texture=64.0, clamp_psi=True,
+                  flow=dict(smoothness=1.0, iterations=2, uniform_iterations=2))
+    with torch.no_grad():
+        m.source_head.bias.fill_(0.3)  # a uniform positive source: new rain of expm1(0.3) = 0.35 mm/h everywhere
+    x = torch.zeros(1, 6, 256, 256)
+    out = m(x, torch.ones(1, 1, 256, 256, dtype=torch.bool), torch.zeros(1, 4), members=8)
+    rate = torch.expm1(out["forecast"][0, :, 0].clamp(0, Y_MAX))
+    assert abs(float(rate.mean()) / math.expm1(0.3) - 1) < 0.1          # areal mean rate kept
+    wet = (rate > 0.1).float().mean()
+    assert 0.08 < float(wet) < 0.3                                        # intermittent, not haze
+    assert float((rate[0] - rate[1]).abs().mean()) > 0.1                 # different cells in every member

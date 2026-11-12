@@ -94,15 +94,17 @@ class DisplacementForecaster:
     validation cases; the CRPS is flat between 1.5 and 2 and hardly depends on the scale (64-1024 km).
     """
 
-    def __init__(self, members: int, std: float = 1.5, cells: int = 32):
-        self.members, self.std, self.cells = members, std, cells
+    def __init__(self, members: int, std: float = 1.5, cells: int = 32, smoothness: float = 0.1):
+        self.members, self.std, self.cells, self.smoothness = members, std, cells, smoothness
         self.provenance = {"method": "displacement", "members": members, "std": std, "cells": cells}
+        if smoothness != 0.1:  # 0.1: the strongest displacement baseline; 1.0: the untrained network (training flow)
+            self.provenance["smoothness"] = smoothness
 
     @torch.no_grad()
     def __call__(self, history: np.ndarray, context: np.ndarray, seed: int) -> torch.Tensor:
         valid = torch.from_numpy(np.isfinite(history).all(0))[None, None].cuda()
         y = torch.log1p(torch.from_numpy(np.nan_to_num(history, nan=0.0))).cuda()[None]
-        velocity = estimate_velocity(y, valid)
+        velocity = estimate_velocity(y, valid, smoothness=self.smoothness)
         generator = torch.Generator(device="cuda").manual_seed(seed)
         velocity = velocity + self.std * smooth_noise(self.members, 2, *velocity.shape[-2:], self.cells, generator, "cuda")
         latest = y[:, -1:].expand(self.members, -1, -1, -1)
