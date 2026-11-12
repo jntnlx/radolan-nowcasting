@@ -39,3 +39,22 @@ def test_untrained_network_with_flow_is_optical_flow_extrapolation():
     latest = inputs()[0][:, -1:]
     expected = torch.cat([sample(latest, p) for p in departure_points(out["prior"], 5, upsample=4)], dim=1).clamp(min=0)
     assert torch.allclose(out["forecast"][:, 0], expected, atol=1e-4)
+
+
+def test_untrained_network_with_motion_noise_is_a_displacement_ensemble():
+    from nowcast.advection import deformation, sample
+    torch.manual_seed(0)
+    model = Nowcaster(history=4, leads=5, widths=(8, 16, 16, 32), depths=(1, 1, 1, 1), film_levels=(3,), c_cond=16,
+                      velocity_level=2, optical_flow=False, motion_noise=0.3, motion_cells=8, source_level=1)  # 32 px correlation
+    x, valid, context = inputs(h=64, w=64)
+    out = model(x, valid, context, members=3)
+    f = out["forecast"]
+    assert f.shape == (2, 3, 5, 64, 64) and (f[:, 0] - f[:, 1]).abs().mean() > 1e-3   # members differ before any training
+    # every member is the analysis seen from its own departure points (no source yet) ...
+    latest = x[:, -1:].repeat_interleave(3, dim=0)
+    assert torch.allclose(f.reshape(6, 5, 64, 64)[:, -1], sample(latest, out["points"][4])[:, 0].clamp(min=0), atol=1e-4)
+    # ... under a smooth perturbation that shifts features without deforming them much,
+    assert float(deformation(out["points"][4].detach())[0].median()) < 1.2
+    # while the physics terms of the objective see the common motion only (here: none).
+    assert float(out["points_rigid"].sub(out["points_rigid"][:1]).abs().max()) < 1e-6
+    assert torch.allclose(out["points_past"][0], out["points_past"][0][:1].expand_as(out["points_past"][0]))

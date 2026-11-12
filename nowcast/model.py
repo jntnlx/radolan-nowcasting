@@ -39,8 +39,21 @@ evolution that is coherent over the noise correlation scales. The velocity is pr
 noise acts on growth and decay. The encoder runs once per sample, the
 decoder once per member.
 
+Displacement as the primary uncertainty (`motion_noise` > 0). Where the rain
+will be is the largest uncertainty of a nowcast: an ensemble that only
+displaces the analysis with smooth random velocity perturbations, without any
+training, has the CRPS of STEPS. Each member therefore moves with its own
+perturbation, amplitude(x) * xi_m(x), where xi_m is a random field that is
+smooth on ~500 km (so that it shifts whole systems and does not deform them)
+and the amplitude is predicted by the encoder, starting from `motion_noise`.
+At a given pixel the members then show different parts of the observed field,
+which is itself the most realistic generator of small-scale texture there is.
+The source term can be predicted on a coarser grid (`source_level`), as a
+smooth growth/decay field that modulates this texture instead of replacing it.
+
 With zero-initialized heads the untrained network is exactly optical-flow
-extrapolation (Lagrangian persistence). Training moves it from there.
+extrapolation (Lagrangian persistence), or with `motion_noise` the
+displacement ensemble of the analysis. Training moves it from there.
 """
 
 import math
@@ -49,7 +62,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .advection import departure_points, estimate_velocity, sample
+from .advection import departure_points, estimate_velocity, sample, smooth_noise
 
 
 def _groups(channels: int) -> int:
@@ -116,6 +129,8 @@ def from_checkpoint(args: dict) -> "Nowcaster":
     """
     flow = LEGACY_FLOW if args.get("flow_smoothness") is None else dict(smoothness=args["flow_smoothness"])
     return Nowcaster(history=args["history"], leads=args["leads"], eulerian=args.get("eulerian", False),
+                     motion_noise=args.get("motion_noise", 0.0), motion_cells=args.get("motion_cells", 32),
+                     source_level=args.get("source_level", 0),
                      optical_flow=not args.get("no_optical_flow", True),  # lag_v1: network-only motion
                      noise=args.get("noise", "concat"),                    # lag_v1, lag_v2
                      film_levels=tuple(args.get("film_levels", (5, 2))),
@@ -155,6 +170,9 @@ class Nowcaster(nn.Module):
         eulerian: bool = False,       # ablation: no advection, all change comes from the source term
         optical_flow: bool = True,    # physical first guess of the motion (False: network-only motion)
         flow: dict | None = None,     # options of advection.estimate_velocity (None: its defaults)
+        motion_noise: float = 0.0,    # initial std of the members' velocity perturbation, px per step (0: none)
+        motion_cells: int = 32,       # its correlation length in cells of the velocity grid (32 x 16 km = 512 km)
+        source_level: int = 0,        # source predicted on the 2^level km grid (0: full resolution)
     ):
         super().__init__()
         self.history, self.leads = history, leads
@@ -188,11 +206,17 @@ class Nowcaster(nn.Module):
         self.eulerian = eulerian
         self.optical_flow = optical_flow and not eulerian
         self.flow = dict(flow or {})
+        self.motion_noise, self.motion_cells, self.source_level = motion_noise, motion_cells, source_level
+        if source_level > velocity_level:
+            raise ValueError("the source cannot be coarser than the velocity grid")
         self.velocity_head = nn.Conv2d(widths[self.velocity_level], 2, 3, padding=1)
-        self.source_head = nn.Conv2d(widths[0], leads, 3, padding=1)
-        for head in (self.velocity_head, self.source_head):
-            nn.init.zeros_(head.weight)
-            nn.init.zeros_(head.bias)
+        self.source_head = nn.Conv2d(widths[source_level], leads, 3, padding=1)
+        # log amplitude of the velocity perturbation relative to motion_noise, from the (deterministic) encoder
+        self.spread_head = nn.Conv2d(widths[top], 1, 1) if motion_noise > 0 else None
+        for head in (self.velocity_head, self.source_head, self.spread_head):
+            if head is not None:
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
 
     def encode(self, inputs, valid, context, prior):
         cond = self.cond(context)
@@ -232,7 +256,7 @@ class Nowcaster(nn.Module):
         noise = self._noise_fields(skips, generator)
         x = self.bottleneck(torch.cat([skips[top], *self._noise(skips[top], top, generator)], dim=1), cond, noise[top])
         velocity = None
-        for i in reversed(range(top)):
+        for i in reversed(range(self.source_level, top)):  # levels finer than the source grid are not needed
             x = self.up[i](F.interpolate(x, scale_factor=2, mode="nearest"))
             x = self.decoder[i](torch.cat([x, skips[i], *self._noise(skips[i], i, generator)], dim=1), cond, noise[i])
             if i == self.velocity_level:
@@ -266,10 +290,19 @@ class Nowcaster(nn.Module):
         cond = cond.repeat_interleave(members, dim=0)
         velocity, source, raw = self.decode(skips, cond, prior.repeat_interleave(members, dim=0), generator)
         velocity, source = velocity.float(), source.float()
+        if self.source_level:
+            source = F.interpolate(source, size=(h, w), mode="bilinear", align_corners=False)
+        factor = 2**self.velocity_level
+
+        common = velocity  # the part of the motion that all members are meant to share: first guess + correction
+        if self.motion_noise > 0 and not self.eulerian:
+            xi = smooth_noise(velocity.shape[0], 2, *velocity.shape[-2:], self.motion_cells, generator, velocity.device)
+            log_amplitude = 3 * torch.tanh(self.spread_head(skips[-1]).float() / 3)  # within a factor e^3 of motion_noise
+            amplitude = self.motion_noise * torch.exp(F.interpolate(log_amplitude, size=velocity.shape[-2:], mode="bilinear", align_corners=False))
+            velocity = common + amplitude * xi
 
         latest = inputs[:, -1:].float().repeat_interleave(members, dim=0)
         psi = latest + source  # Lagrangian forecast in analysis-time coordinates
-        factor = 2**self.velocity_level
         points = departure_points(velocity, max(self.leads, self.history - 1), upsample=factor)
         # One interpolation per lead, batched over leads: (B*M*K, 1, H, W) sampled at X_k.
         bm = b * members
@@ -285,4 +318,9 @@ class Nowcaster(nn.Module):
             "prior": prior,
             "source": unstack(source),
             "points": points,  # (B * M, 2, H, W) each, member-major within sample
+            # The physics terms of the objective act on the common motion, not on the random perturbation:
+            # consistency with the past (fine-grid departure points of the past steps), and rigidity
+            # (the last-lead map on the velocity grid; its Jacobian is the same in any length unit).
+            "points_past": departure_points(common, self.history - 1, upsample=factor) if common is not velocity else points,
+            "points_rigid": departure_points(common / factor, self.leads)[-1] if common is not velocity else points[self.leads - 1],
         }

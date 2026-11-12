@@ -71,6 +71,12 @@ def parse_args(argv=None):
     p.add_argument("--rigid-weight", type=float, default=0.1,
                    help="penalty on the shear (s1 - s2)^2 of each member's trajectory map at the last lead: keeps the "
                         "learned motion from deforming advected texture into streaks (advection.shear)")
+    p.add_argument("--motion-noise", type=float, default=0.0,
+                   help="initial std (px per step) of each member's smooth velocity perturbation; 0: none. With 1.5 "
+                        "the untrained model is the displacement ensemble of the analysis, which has the CRPS of STEPS")
+    p.add_argument("--motion-cells", type=int, default=32, help="correlation length of that perturbation, in 16 km cells")
+    p.add_argument("--source-level", type=int, default=0,
+                   help="predict the source on the 2^level km grid: a smooth growth/decay field (0: full resolution)")
     p.add_argument("--well-weight", type=float, default=0.0,
                    help="penalty on psi = y0 + S below -well_margin: bounds how deeply dry pixels are suppressed")
     p.add_argument("--well-margin", type=float, default=1.0)
@@ -103,7 +109,7 @@ def objective(model, batch, args, members=None, alpha=None, generator=None):
     scores["motion"] = motion_consistency(
         batch["inputs"].float().repeat_interleave(m, dim=0),
         batch["input_valid"][:, 0].repeat_interleave(m, dim=0),
-        out["points"],
+        out["points_past"],
     )
     scores["smoothness"] = smoothness(out["velocity"])
     scores["saturation"] = out["correction_raw"].pow(2).mean()
@@ -128,7 +134,7 @@ def objective(model, batch, args, members=None, alpha=None, generator=None):
         scores["loss"] = scores["loss"] + args.well_weight * scores["wells"]
     last = out["points"][args.leads - 1].float()
     with torch.set_grad_enabled(args.rigid_weight > 0 and torch.is_grad_enabled()):
-        scores["rigid"] = shear(last).mean()
+        scores["rigid"] = shear(out["points_rigid"].float()).mean()
     if args.rigid_weight > 0:
         scores["loss"] = scores["loss"] + args.rigid_weight * scores["rigid"]
     scores["speed_kmh"] = 12 * out["velocity"].norm(dim=2).mean()

@@ -11,7 +11,10 @@ with a fixed seed. Membership depends on the analysis time only, never on
 the future, so no method is favoured by the selection. Every method is scored
 on the identical cases and pixels over the whole 1024 x 832 km domain, so
 the network sees inflow from upstream radar data rather than from crop edges.
-The baseline "flow" is extrapolation with the optical flow of advection.py.
+The baseline "flow" is extrapolation with the optical flow of advection.py;
+"displacement" is the ensemble of such extrapolations in which every member
+moves with its own smooth random velocity perturbation: no training, no
+growth or decay, and members that are radar fields by construction.
 
 Results go to runs/eval/<population>/<method>.json: pooled scores per lead
 time (verify.py) and per-case CRPS for paired comparisons. An interrupted
@@ -32,7 +35,7 @@ import torch
 from . import baselines
 from .config import RUNS_DIR, STEPS_PER_HOUR, TEST_YEARS, VAL_YEARS
 from .data import time_context
-from .advection import departure_points, estimate_velocity, sample
+from .advection import departure_points, estimate_velocity, sample, smooth_noise
 from .model import from_checkpoint
 from .radklim import depth_to_rate
 from .store import Season
@@ -84,6 +87,28 @@ class FlowForecaster:
         return y_to_rate(torch.cat([sample(y[:, -1:], p) for p in points], dim=1))
 
 
+class DisplacementForecaster:
+    """
+    Displacement ensemble of the analysis: flow extrapolation with a smooth (512 km) random velocity
+    perturbation per member. `std` (px per step, of the underlying white noise) was chosen on 12
+    validation cases; the CRPS is flat between 1.5 and 2 and hardly depends on the scale (64-1024 km).
+    """
+
+    def __init__(self, members: int, std: float = 1.5, cells: int = 32):
+        self.members, self.std, self.cells = members, std, cells
+        self.provenance = {"method": "displacement", "members": members, "std": std, "cells": cells}
+
+    @torch.no_grad()
+    def __call__(self, history: np.ndarray, context: np.ndarray, seed: int) -> torch.Tensor:
+        valid = torch.from_numpy(np.isfinite(history).all(0))[None, None].cuda()
+        y = torch.log1p(torch.from_numpy(np.nan_to_num(history, nan=0.0))).cuda()[None]
+        velocity = estimate_velocity(y, valid)
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        velocity = velocity + self.std * smooth_noise(self.members, 2, *velocity.shape[-2:], self.cells, generator, "cuda")
+        latest = y[:, -1:].expand(self.members, -1, -1, -1)
+        return y_to_rate(torch.cat([sample(latest, p) for p in departure_points(velocity, LEADS, upsample=16)], dim=1))
+
+
 class NetworkForecaster:
     def __init__(self, checkpoint: Path, members: int, chunk: int = 5):
         state = torch.load(checkpoint, map_location="cuda", weights_only=False)
@@ -111,7 +136,7 @@ class NetworkForecaster:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--method", required=True, help="persistence | extrapolation | flow | steps | path to a checkpoint")
+    p.add_argument("--method", required=True, help="persistence | extrapolation | flow | displacement | steps | path to a checkpoint")
     p.add_argument("--cases", type=int, default=120)
     p.add_argument("--members", type=int, default=20)
     p.add_argument("--test", action="store_true", help="evaluate the locked test seasons")
@@ -124,7 +149,7 @@ def main(argv=None):
     cases = analysis_times(years, args.cases)
     is_network = args.method.endswith(".pt")
     name = args.name or (Path(args.method).parent.name if is_network else args.method)
-    members = args.members if (is_network or args.method == "steps") else 1
+    members = args.members if (is_network or args.method in ("steps", "displacement")) else 1
     out_dir = RUNS_DIR / "eval" / population
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -133,8 +158,10 @@ def main(argv=None):
     per_case = []
     partial = out_dir / f"{name}.partial.pt"
     forecaster = None
-    if is_network or args.method == "flow":
-        forecaster = NetworkForecaster(Path(args.method), members) if is_network else FlowForecaster()
+    if is_network:
+        forecaster = NetworkForecaster(Path(args.method), members)
+    elif args.method in ("flow", "displacement"):
+        forecaster = FlowForecaster() if args.method == "flow" else DisplacementForecaster(members)
     provenance = getattr(forecaster, "provenance", {"method": args.method, "members": members})
     if partial.exists():
         state = torch.load(partial, map_location="cuda", weights_only=False)

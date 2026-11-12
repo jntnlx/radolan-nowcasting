@@ -73,6 +73,18 @@ def main():
                   + "  acc 1 h: " + ", ".join(f"{s.get(f'crps_acc60_y_{km}km', float('nan')):.4f}" for km in (1, 16))
                   + "  acc 2 h: " + ", ".join(f"{s.get(f'crps_acc120_y_{km}km', float('nan')):.4f}" for km in (1, 16)))
 
+    print("\nMember structure @30/60/120 min. Power of member 0 relative to observed, by wavelength; frequency bias by threshold;")
+    print("FSS of single members for 5 mm/h at 1 and 5 km. Read together with scripts/member_panel.py: none of these sees everything.")
+    bands = ((2, 5), (5, 10), (10, 20), (20, 50), (50, 150))
+    for name, r in results.items():
+        s = r["summary"]
+        obs, fcst = np.array(s["spectrum_obs"]), np.array(s["spectrum_fcst"])
+        wavelength = 512 / np.maximum(np.arange(obs.shape[1]), 1)
+        ratio = lambda lo, hi, k: fcst[k - 1][(wavelength >= lo) & (wavelength < hi)].sum() / obs[k - 1][(wavelength >= lo) & (wavelength < hi)].sum()
+        print(f"  {name:20s} power " + "  ".join(f"{lo}-{hi} km " + "/".join(f"{ratio(lo, hi, k):.2f}" for k in LEADS_SHOWN) for lo, hi in bands))
+        print(f"  {'':20s} bias  " + "  ".join(f"{t} mm/h " + "/".join(f"{s[f'freq_bias_{t}'][k - 1]:.2f}" for k in LEADS_SHOWN) for t in ("0.5", "1.0", "5.0", "10.0", "20.0"))
+              + "   fss5 1 km " + "/".join(f"{s['fss_5.0_1km'][k - 1]:.3f}" for k in LEADS_SHOWN) + "  5 km " + "/".join(f"{s['fss_5.0_5km'][k - 1]:.3f}" for k in LEADS_SHOWN))
+
     paired = dict(results)
     for f in sorted(args.directory.glob("*.partial.pt")):
         name = f.name.removesuffix(".partial.pt")

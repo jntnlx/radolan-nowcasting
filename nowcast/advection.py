@@ -72,6 +72,17 @@ def departure_points(velocity: torch.Tensor, steps: int, upsample: int = 1) -> l
     return points
 
 
+def smooth_noise(batch: int, channels: int, height: int, width: int, cell: int, generator=None, device=None) -> torch.Tensor:
+    """
+    Smooth Gaussian random fields (batch, channels, height, width) with correlation length `cell` grid
+    points: white noise of unit variance on a grid coarser by `cell`, bicubically interpolated
+    (which lowers the pointwise standard deviation to about 0.8).
+    """
+    coarse = torch.randn(batch, channels, height // cell + 3, width // cell + 3, device=device, generator=generator)
+    fine = F.interpolate(coarse, scale_factor=cell, mode="bicubic", align_corners=False)
+    return fine[..., cell:cell + height, cell:cell + width]
+
+
 def inside(position: torch.Tensor, height: int, width: int) -> torch.Tensor:
     """True where a departure point lies within the field (B, H, W)."""
     x, y = position[:, 0], position[:, 1]
