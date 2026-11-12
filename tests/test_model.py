@@ -85,3 +85,18 @@ def test_texture_keeps_the_areal_mean_rate_of_new_rain_and_makes_it_intermittent
     wet = (rate > 0.1).float().mean()
     assert 0.08 < float(wet) < 0.3                                        # intermittent, not haze
     assert float((rate[0] - rate[1]).abs().mean()) > 0.1                 # different cells in every member
+
+
+def test_texture_spreads_heavy_new_rain_instead_of_concentrating_it():
+    from nowcast.model import Y_MAX
+    torch.manual_seed(0)
+    m = Nowcaster(history=6, leads=2, film_levels=(5,), source_level=2, texture=64.0, clamp_psi=True,
+                  flow=dict(smoothness=1.0, iterations=2, uniform_iterations=2))
+    with torch.no_grad():
+        m.source_head.bias.fill_(math.log1p(11.0))  # an expected 11 mm/h of new rain everywhere
+    x = torch.zeros(1, 6, 256, 256)
+    out = m(x, torch.ones(1, 1, 256, 256, dtype=torch.bool), torch.zeros(1, 4), members=8)
+    rate = torch.expm1(out["forecast"][0, :, 0].clamp(0, Y_MAX))
+    assert abs(float(rate.mean()) / 11.0 - 1) < 0.1     # areal mean kept
+    assert float((rate > 0.1).float().mean()) > 0.8      # widespread, not sparse cells
+    assert float(rate.quantile(0.999)) < 6 * 11.0        # no extreme blocks (fixed q = 1 gave ~15x the mean)

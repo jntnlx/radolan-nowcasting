@@ -116,8 +116,8 @@ class Level(nn.Module):
 Y_MAX = math.log1p(500.0)  # 500 mm/h: above any rain rate observed in RADKLIM
 V_MAX = 10.0                # px per step = 120 km/h: above any precipitation system motion
 DRY_Y = math.log1p(0.1)     # below 0.1 mm/h a pixel counts as dry (new rain there is redistributed as cells)
-TEXTURE_Q = 1.0             # threshold of the cascade weight in standard deviations of eta: P(eta > q) = 16% of the area
-TEXTURE_MEAN = math.exp(-TEXTURE_Q**2 / 2) / math.sqrt(2 * math.pi) - TEXTURE_Q * 0.5 * math.erfc(TEXTURE_Q / math.sqrt(2))  # E[relu(eta - q)]
+CELL_RATE = 3.0             # mm/h: mean rate inside the cells of new rain while their wet fraction is between the bounds
+F_MIN, F_MAX = 0.16, 0.95   # bounds of the wet fraction of new rain (0.16: threshold q = 1 standard deviation of eta)
 
 
 LEGACY_FLOW = dict(smoothness=0.01, uniform_iterations=0, lr_end=0.3)  # flow layer of runs before lag_v5
@@ -329,19 +329,6 @@ class Nowcaster(nn.Module):
         if self.source_level:
             source = F.interpolate(source, size=(h, w), mode="bilinear", align_corners=False)
         latest = inputs[:, -1:].float().repeat_interleave(members, dim=0)
-        if self.texture > 0:
-            # New rain on dry pixels. The network predicts a smooth intensity h there (the pooled CRPS terms
-            # reward its areal mean); left smooth, h is the same light haze in every member, a poor forecast
-            # at the pixel scale and nothing like radar rain. Rain is a multiplicative cascade: each member
-            # redistributes the rain rate of h with a random weight of mean one, W = relu(eta - q) / E[relu(eta - q)],
-            # eta a texture field (advection.texture_noise). Areal mean rates are kept (a 0.5 mm/h haze becomes
-            # cells of ~3 mm/h, peaks ~12 mm/h, on ~16% of the area), different in every member. One field per
-            # member for all leads, in analysis-time coordinates: cells persist and move with the member.
-            eta = texture_noise(b * members, h, w, self.texture, generator=generator, device=source.device)
-            weight = F.relu(eta - TEXTURE_Q) / TEXTURE_MEAN
-            new = (latest < DRY_Y) & (source > 0)
-            cells = torch.log1p(torch.expm1(source.clamp(min=0, max=Y_MAX)) * weight)
-            source = torch.where(new, cells, source)
         factor = 2**self.velocity_level
 
         common = velocity  # the part of the motion that all members are meant to share: first guess + correction
@@ -350,6 +337,28 @@ class Nowcaster(nn.Module):
             log_amplitude = 3 * torch.tanh(self.spread_head(skips[-1]).float() / 3)  # within a factor e^3 of motion_noise
             amplitude = self.motion_noise * torch.exp(F.interpolate(log_amplitude, size=velocity.shape[-2:], mode="bilinear", align_corners=False))
             velocity = common + amplitude * xi
+
+        if self.texture > 0:  # drawn after the motion noise: switching it on leaves each member's displacement unchanged
+            # New rain on dry pixels. The network predicts a smooth intensity h there (the pooled CRPS terms
+            # reward its areal mean); left smooth, h is the same light haze in every member, a poor forecast
+            # at the pixel scale and nothing like radar rain. Rain is a multiplicative cascade: each member
+            # redistributes the rain rate R_h of h with a random weight of mean one, W = relu(eta - q) / E[relu(eta - q)],
+            # eta a texture field (advection.texture_noise), different in every member. One field per member for all
+            # leads, in analysis-time coordinates: cells persist and move with the member. Areal mean rates are kept
+            # for every q. The wet fraction f = P(eta > q) grows with R_h, as in observed rain fields (heavy areal
+            # rain is widespread, not a few extreme cells): f = R_h / CELL_RATE within [F_MIN, F_MAX]. A 0.5 mm/h
+            # haze becomes cells of ~3 mm/h on 16% of the area; an expected 11 mm/h (inflow at the domain edge)
+            # becomes textured rain on 95% of it. (With q fixed at 1 that became 70 mm/h blocks.)
+            eta = texture_noise(b * members, h, w, self.texture, generator=generator, device=source.device)
+            rate = torch.expm1(source.clamp(min=0, max=Y_MAX))
+            q = torch.special.ndtri(1 - (rate / CELL_RATE).clamp(F_MIN, F_MAX))
+            weight = F.relu(eta - q) / (torch.exp(-q**2 / 2) / math.sqrt(2 * math.pi) - q * 0.5 * torch.erfc(q / math.sqrt(2)))
+            # only where the radar observed dryness: in coverage gaps the analysis is 0 for lack of data, the
+            # network predicts large new rain there, and the cascade would concentrate it into 20-50 mm/h blocks
+            observed = valid.repeat_interleave(members, dim=0).bool()
+            new = (latest < DRY_Y) & observed & (source > 0)
+            cells = torch.log1p(rate * weight)
+            source = torch.where(new, cells, source)
 
         psi = latest + source  # Lagrangian forecast in analysis-time coordinates
         if self.clamp_psi:
