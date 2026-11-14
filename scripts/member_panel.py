@@ -44,11 +44,12 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--out", type=Path, default=None, help="directory (default: the run directory)")
+    p.add_argument("--motion-detail", type=float, default=None, help="lead (min) until which the detail of a less smooth optical flow acts on the motion (default: as trained)")
     args = p.parse_args()
     out = args.out or args.checkpoint.parent
     out.mkdir(parents=True, exist_ok=True)
     name = args.checkpoint.parent.name
-    network, displaced = NetworkForecaster(args.checkpoint, 5), DisplacementForecaster(5, smoothness=1.0)
+    network, displaced = NetworkForecaster(args.checkpoint, 5, motion_detail=args.motion_detail), DisplacementForecaster(5, smoothness=1.0)
 
     for case in CASES:
         year, t0 = time_index(datetime.fromisoformat(case + ":00"))

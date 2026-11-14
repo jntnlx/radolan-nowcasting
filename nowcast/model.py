@@ -62,7 +62,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .advection import departure_points, estimate_velocity, sample, smooth_noise, texture_noise
+from .advection import departure_points, departure_points_fading, detail_weights, estimate_velocity, sample, smooth_noise, texture_noise
+from .config import STEPS_PER_HOUR
 
 
 def _groups(channels: int) -> int:
@@ -136,6 +137,7 @@ def from_checkpoint(args: dict) -> "Nowcaster":
                      source_level=args.get("source_level", 0),
                      texture=args.get("texture", 0.0), clamp_psi=args.get("clamp_psi", False),       # session 9
                      padding=args.get("padding", "border"), interpolation=args.get("interpolation", "bilinear"),
+                     motion_detail=args.get("motion_detail", 0.0),                                    # session 11
                      optical_flow=not args.get("no_optical_flow", True),  # lag_v1: network-only motion
                      noise=args.get("noise", "concat"),                    # lag_v1, lag_v2
                      film_levels=tuple(args.get("film_levels", (5, 2))),
@@ -208,6 +210,8 @@ class Nowcaster(nn.Module):
         clamp_psi: bool = False,      # clamp psi to [0, Y_MAX] before resampling, one-sided gradients (False: as before session 9)
         padding: str = "border",      # inflow across the domain edge: "border" (repeat edge row) or "reflection"
         interpolation: str = "bilinear",  # resampling of psi at the departure points: "bilinear" or "bicubic"
+        motion_detail: float = 0.0,   # > 0: the detail of a less smooth optical flow acts on the motion, fading out linearly until this lead (min)
+        detail_smoothness: float = 0.1,   # Horn-Schunck weight of that flow (0.1: best for pure extrapolation)
     ):
         super().__init__()
         self.history, self.leads = history, leads
@@ -246,6 +250,7 @@ class Nowcaster(nn.Module):
             raise ValueError("the source cannot be coarser than the velocity grid")
         self.velocity_head = nn.Conv2d(widths[self.velocity_level], 2, 3, padding=1)
         self.texture, self.clamp_psi, self.padding, self.interpolation = texture, clamp_psi, padding, interpolation
+        self.motion_detail, self.detail_smoothness = motion_detail, detail_smoothness
         self.source_head = nn.Conv2d(widths[source_level], leads, 3, padding=1)
         # log amplitude of the velocity perturbation relative to motion_noise, from the (deterministic) encoder
         self.spread_head = nn.Conv2d(widths[top], 1, 1) if motion_noise > 0 else None
@@ -312,8 +317,18 @@ class Nowcaster(nn.Module):
             return estimate_velocity(inputs, valid, grid=grid, **self.flow)
         return inputs.new_zeros(b, 2, h // grid, w // grid, dtype=torch.float32)
 
-    def forward(self, inputs, valid, context, members: int = 2, generator=None, prior=None) -> dict[str, torch.Tensor]:
-        """`prior`: a precomputed `first_guess`, to reuse it across calls for more members."""
+    def flow_detail(self, inputs, valid, prior) -> torch.Tensor:
+        """
+        What a less smooth optical flow sees beyond the first guess: local deformation that fits the
+        last 30 min. It is right for the first leads (pure extrapolation prefers it) but does not
+        persist: extrapolated for 2 h it draws the rain into streaks. With `motion_detail` it acts
+        on the trajectories with a weight that falls to zero at that lead.
+        """
+        detailed = estimate_velocity(inputs, valid, grid=2 ** self.velocity_level, **{**self.flow, "smoothness": self.detail_smoothness})
+        return detailed - prior
+
+    def forward(self, inputs, valid, context, members: int = 2, generator=None, prior=None, detail=None) -> dict[str, torch.Tensor]:
+        """`prior`, `detail`: a precomputed `first_guess` and `flow_detail`, to reuse them across calls for more members."""
         b, _, h, w = inputs.shape
         if h % self.stride or w % self.stride:
             raise ValueError(f"spatial size {(h, w)} must be divisible by {self.stride}")
@@ -366,7 +381,15 @@ class Nowcaster(nn.Module):
             # departure points sees the physical field and not the depth of dry wells below zero (whose
             # cliffs, sampled at random positions by the member displacements, made training diverge)
             psi = clamp_one_sided(psi, 0.0, Y_MAX)
-        points = departure_points(velocity, max(self.leads, self.history - 1), upsample=factor)
+        steps = max(self.leads, self.history - 1)
+        fading = self.motion_detail > 0 and self.optical_flow
+        if fading:
+            if detail is None:
+                detail = self.flow_detail(inputs, valid, prior)
+            weights = detail_weights(steps, self.motion_detail, 60 / STEPS_PER_HOUR)
+            points = departure_points_fading(velocity, detail.repeat_interleave(members, dim=0), weights, steps, upsample=factor)
+        else:
+            points = departure_points(velocity, steps, upsample=factor)
         # One interpolation per lead, batched over leads: (B*M*K, 1, H, W) sampled at X_k.
         bm = b * members
         stacked = torch.stack(points[:self.leads], dim=1).reshape(bm * self.leads, 2, h, w)
@@ -384,6 +407,6 @@ class Nowcaster(nn.Module):
             # The physics terms of the objective act on the common motion, not on the random perturbation:
             # consistency with the past (fine-grid departure points of the past steps), and rigidity
             # (the last-lead map on the velocity grid; its Jacobian is the same in any length unit).
-            "points_past": departure_points(common, self.history - 1, upsample=factor) if common is not velocity else points,
-            "points_rigid": departure_points(common / factor, self.leads)[-1] if common is not velocity else points[self.leads - 1],
+            "points_past": departure_points(common, self.history - 1, upsample=factor) if common is not velocity or fading else points,
+            "points_rigid": departure_points(common / factor, self.leads)[-1] if common is not velocity or fading else points[self.leads - 1],
         }

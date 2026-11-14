@@ -2,9 +2,11 @@
 
 import math
 
+import pytest
 import torch
 
-from nowcast.advection import deformation, departure_points, estimate_velocity, grid, sample, shear, texture_noise
+from nowcast.advection import (deformation, departure_points, departure_points_fading, detail_weights, estimate_velocity, grid,
+                               sample, shear, texture_noise)
 from nowcast.verify import radial_spectrum
 
 
@@ -61,6 +63,27 @@ def test_coarse_trajectories_match_fine_ones_for_smooth_flow():
     approx = departure_points(coarse, 12, upsample=4)[-1]
     interior = (slice(None), slice(None), slice(24, -24), slice(24, -24))
     assert float((approx - reference)[interior].abs().max()) < 0.3  # px, after 12 steps (~20 px travelled)
+
+
+def test_fading_detail_reduces_to_stationary_flow_and_keeps_its_displacement():
+    """Time-dependent trajectories: without detail they are the stationary ones; a uniform detail that fades
+    out adds the displacement it produced while it lasted, and nothing afterwards."""
+    torch.manual_seed(0)
+    velocity = torch.tensor([1.5, -0.75]).reshape(1, 2, 1, 1) + 0.3 * torch.randn(1, 2, 1, 1) * torch.ones(1, 2, 24, 24)
+    detail = torch.tensor([0.6, 0.4]).reshape(1, 2, 1, 1).expand(1, 2, 24, 24)
+    steps = 12
+    stationary = departure_points(velocity, steps, upsample=4)
+    for a, b in zip(departure_points_fading(velocity, detail, [0.0] * steps, steps, upsample=4), stationary):
+        assert torch.allclose(a, b, atol=1e-5)
+
+    weights = detail_weights(steps, minutes=30)  # 5 min steps: 11/12, 9/12, ..., 1/12, then 0
+    assert weights[0] == pytest.approx(11 / 12) and weights[5] == pytest.approx(1 / 12) and weights[6:] == [0.0] * 6
+    fading = departure_points_fading(velocity, detail, weights, steps, upsample=4)
+    for k in (1, 6, 12):
+        extra = (stationary[k - 1] - fading[k - 1])[0, :, 48, 48]  # upstream shift by the detail
+        expected = sum(weights[:k]) * detail[0, :, 0, 0]
+        assert torch.allclose(extra, expected, atol=1e-4)
+    assert sum(weights) == pytest.approx(3.0)  # the detail displaces by 3 steps' worth in total, reached at +30 min
 
 
 def test_variational_flow_recovers_a_translation():

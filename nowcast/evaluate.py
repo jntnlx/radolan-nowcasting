@@ -112,11 +112,14 @@ class DisplacementForecaster:
 
 
 class NetworkForecaster:
-    def __init__(self, checkpoint: Path, members: int, chunk: int = 5):
+    def __init__(self, checkpoint: Path, members: int, chunk: int = 5, motion_detail: float | None = None):
         state = torch.load(checkpoint, map_location="cuda", weights_only=False)
         args = state["args"]
         self.model = from_checkpoint(args).cuda().eval()
         self.provenance = {"checkpoint": str(checkpoint), "step": state.get("step"), "members": members}
+        if motion_detail is not None:  # an option of the forecast operator, not of the weights: any checkpoint takes it
+            self.model.motion_detail = motion_detail
+            self.provenance["motion_detail"] = motion_detail
         self.model.load_state_dict(state["model"])
         self.members, self.chunk, self.history = members, chunk, args["history"]
         self.generator = torch.Generator(device="cuda")
@@ -128,10 +131,11 @@ class NetworkForecaster:
         ctx = torch.from_numpy(context).cuda()[None]
         self.generator.manual_seed(seed)
         prior = self.model.first_guess(y, valid)
+        detail = self.model.flow_detail(y, valid, prior) if self.model.motion_detail > 0 else None
         out = []
         for _ in range(0, self.members, self.chunk):
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                f = self.model(y, valid, ctx, members=self.chunk, generator=self.generator, prior=prior)["forecast"]
+                f = self.model(y, valid, ctx, members=self.chunk, generator=self.generator, prior=prior, detail=detail)["forecast"]
             out.append(y_to_rate(f[0].float()))
         return torch.cat(out)[:self.members]
 
@@ -144,6 +148,9 @@ def main(argv=None):
     p.add_argument("--test", action="store_true", help="evaluate the locked test seasons")
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--name", default=None, help="result name (default: method or run name)")
+    p.add_argument("--motion-detail", type=float, default=None,
+                   help="network only: lead (min) until which the detail of a less smooth optical flow acts on the motion "
+                        "(default: as trained; 0 switches it off)")
     args = p.parse_args(argv)
 
     years = TEST_YEARS if args.test else VAL_YEARS
@@ -161,7 +168,7 @@ def main(argv=None):
     partial = out_dir / f"{name}.partial.pt"
     forecaster = None
     if is_network:
-        forecaster = NetworkForecaster(Path(args.method), members)
+        forecaster = NetworkForecaster(Path(args.method), members, motion_detail=args.motion_detail)
     elif args.method in ("flow", "displacement"):
         forecaster = FlowForecaster() if args.method == "flow" else DisplacementForecaster(members)
     provenance = getattr(forecaster, "provenance", {"method": args.method, "members": members})

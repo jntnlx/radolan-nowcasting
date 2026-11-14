@@ -80,6 +80,44 @@ def departure_points(velocity: torch.Tensor, steps: int, upsample: int = 1) -> l
     return points
 
 
+def detail_weights(steps: int, minutes: float, step_minutes: float = 5.0) -> list[float]:
+    """Share of the flow detail in the velocity of each step: 1 at the analysis, falling linearly to 0 at `minutes`."""
+    return [max(0.0, 1.0 - (j + 0.5) * step_minutes / minutes) for j in range(steps)]
+
+
+def departure_points_fading(velocity: torch.Tensor, detail: torch.Tensor, weights: list[float], steps: int,
+                            upsample: int = 1) -> list[torch.Tensor]:
+    """
+    Backward trajectories under the time-dependent velocity u_j = velocity + weights[j] * detail
+    for the step from time j to j + 1 (same conventions as `departure_points`).
+
+    `detail` is the part of the observed motion that fits the recent past but does not persist
+    (local deformation: the difference between a detailed and a nearly rigid optical flow). It acts
+    while its weight lasts, and the displacement it has produced stays. A trajectory arriving at
+    lead k is traced back through u_{k-1}, ..., u_0; on the coarse velocity grid the k (k + 1) / 2
+    steps for all leads cost little.
+    """
+    b, _, h, w = velocity.shape
+    origin = grid(b, h, w, velocity.device, velocity.dtype)
+    fine = grid(b, h * upsample, w * upsample, velocity.device, velocity.dtype)
+    fields = {}
+    for j in range(steps):  # steps after the detail has faded share one field
+        if weights[j] not in fields:
+            fields[weights[j]] = (velocity + weights[j] * detail) / upsample
+    points = []
+    for k in range(1, steps + 1):
+        position = origin
+        for j in reversed(range(k)):
+            u = fields[weights[j]]
+            half = position - 0.5 * sample(u, position)
+            position = position - sample(u, half)
+        displacement = upsample * (position - origin)
+        if upsample > 1:
+            displacement = F.interpolate(displacement, scale_factor=upsample, mode="bilinear", align_corners=False)
+        points.append(fine + displacement)
+    return points
+
+
 def smooth_noise(batch: int, channels: int, height: int, width: int, cell: int, generator=None, device=None) -> torch.Tensor:
     """
     Smooth Gaussian random fields (batch, channels, height, width) with correlation length `cell` grid

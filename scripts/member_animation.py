@@ -47,11 +47,13 @@ def colorize(rate: np.ndarray) -> Image.Image:
     return img.resize((size, size), Image.NEAREST)
 
 
-def network(checkpoint: Path, cascade: bool):
+def network(checkpoint: Path, cascade: bool = False, detail: bool = False):
     state = torch.load(checkpoint, map_location="cuda", weights_only=False)
     args = dict(state["args"])
     if cascade:  # the operator of the session-9 queue: cascade, and mirrored inflow at the domain edge
         args["texture"], args["padding"] = 64.0, "reflection"
+    if detail:  # the flow detail of session 11, fading out until +60 min
+        args["motion_detail"] = 60.0
     model = from_checkpoint(args).cuda().eval()
     model.load_state_dict(state["model"])
 
@@ -80,6 +82,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", nargs=2, action="append", default=[], metavar=("RUN", "LABEL"))
     p.add_argument("--cascade", nargs=2, action="append", default=[], metavar=("RUN", "LABEL"))
+    p.add_argument("--detail", nargs=2, action="append", default=[], metavar=("RUN", "LABEL"),
+                   help="RUN's weights with the fading flow detail (motion_detail 60) switched on at inference")
     p.add_argument("--cases", nargs="+", default=CASES)
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--ms", type=int, default=260, help="frame duration")
@@ -87,6 +91,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     models = [(label, network(RUNS_DIR / run / "best.pt", False)) for run, label in args.run]
     models += [(label, network(RUNS_DIR / run / "best.pt", True)) for run, label in args.cascade]
+    models += [(label, network(RUNS_DIR / run / "best.pt", detail=True)) for run, label in args.detail]
     font, small = ImageFont.truetype(FONT, 15), ImageFont.truetype(FONT, 12)
 
     for case in args.cases:

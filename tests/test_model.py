@@ -42,6 +42,24 @@ def test_untrained_network_with_flow_is_optical_flow_extrapolation():
     assert torch.allclose(out["forecast"][:, 0], expected, atol=1e-4)
 
 
+def test_flow_detail_moves_the_forecast_but_not_the_motion_seen_by_the_physics_terms():
+    from nowcast.advection import departure_points, departure_points_fading, detail_weights, sample
+    rigid, fading = small_model(optical_flow=True), small_model(optical_flow=True)
+    rigid.flow = fading.flow = dict(smoothness=1.0)  # the nearly rigid first guess of the training runs
+    fading.motion_detail = 15.0  # min: the detail acts with weights 5/6, 1/2, 1/6, then not at all
+    x, valid, context = inputs()
+    a, b = rigid(x, valid, context, members=2), fading(x, valid, context, members=2)
+    detail = fading.flow_detail(x, valid, b["prior"])
+    assert float(detail.abs().max()) > 1e-3  # the less smooth flow differs from the first guess
+    points = departure_points_fading(b["prior"], detail, detail_weights(5, 15.0), 5, upsample=4)
+    expected = torch.cat([sample(x[:, -1:], p) for p in points], dim=1).clamp(min=0)
+    assert torch.allclose(b["forecast"][:, 0], expected, atol=1e-4)
+    assert (a["forecast"] - b["forecast"]).abs().max() > 1e-3
+    # consistency with the past and rigidity are judged on the common motion without the detail
+    assert torch.allclose(b["points_past"][0], a["points_past"][0])
+    assert torch.allclose(b["points_rigid"], departure_points(b["prior"].repeat_interleave(2, dim=0) / 4, 5)[-1])
+
+
 def test_untrained_network_with_motion_noise_is_a_displacement_ensemble():
     from nowcast.advection import deformation, sample
     torch.manual_seed(0)

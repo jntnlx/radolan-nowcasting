@@ -26,10 +26,11 @@ def main():
     p.add_argument("--steps", action="store_true", help="include STEPS (several minutes on CPU)")
     p.add_argument("--members", type=int, default=20)
     p.add_argument("--out", type=Path, default=None)
+    p.add_argument("--motion-detail", type=float, default=None, help="lead (min) until which the detail of a less smooth optical flow acts on the motion (default: as trained)")
     args = p.parse_args()
 
     year, t0 = time_index(datetime.fromisoformat(args.time))
-    network = NetworkForecaster(args.checkpoint, args.members)
+    network = NetworkForecaster(args.checkpoint, args.members, motion_detail=args.motion_detail)
     history, obs, context = load_case(year, t0, network.history)
     forecasts = {"network": network(history, context, seed=t0).cpu().numpy()}
     with contextlib.redirect_stdout(io.StringIO()):
